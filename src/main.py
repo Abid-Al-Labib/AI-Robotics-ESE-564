@@ -8,7 +8,7 @@ import mujoco.viewer
 # Add the src directory to Python path to allow absolute imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from env.mujoco_env import MujocoEnv
+from environment.mujoco_env import MujocoEnv
 
 def main():
     print("Initializing MuJoCo Simulation Pipeline...")
