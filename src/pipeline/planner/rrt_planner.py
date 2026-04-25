@@ -96,8 +96,8 @@ class RRTPlanner:
             q[i] = np.random.uniform(self.joint_limits[i, 0], self.joint_limits[i, 1])
         return q
 
-    def nearest(self, nodes, q):
-        dists = np.linalg.norm(nodes - q, axis=1)
+    def nearest(self, nodes, n_nodes, q):
+        dists = np.linalg.norm(nodes[:n_nodes] - q, axis=1)
         return nodes[np.argmin(dists)]
 
     def extend(self, q_near, q_sample, step_size):
@@ -120,44 +120,55 @@ class RRTPlanner:
             return path
         path = [np.array(q) for q in path]
         for _ in range(max_iters):
-            if len(path) < 5:
+            if len(path) < 3:
                 break
-            i = np.random.randint(1, len(path) - 3)
-            j = np.random.randint(i + 2, len(path) - 1)
+            i = np.random.randint(0, len(path) - 2)
+            j = np.random.randint(i + 2, len(path))
             if self.is_collision_free(path[i], path[j]):
                 path = path[:i+1] + path[j:]
         return path
 
-    def plan(self, q_goal, q_init=None, threshold=0.01, step_size=0.1, max_iters=7000, smooth=True):
+    def plan(self, q_goal, q_init=None, threshold=0.01, step_size=0.1, max_iters=20000, smooth=True):
         if q_init is None:
             q_init = self.get_joint_positions()
 
         q_init = np.array(q_init, dtype=float)
         q_goal = np.array(q_goal, dtype=float)
 
-        nodes = np.array([q_init])
+        if not self.is_config_valid(q_goal):
+            print("RRT aborted: goal configuration is in collision")
+            return None
+
+        max_nodes = max_iters + 1
+        nodes = np.zeros((max_nodes, 7))
+        nodes[0] = q_init
+        n_nodes = 1
         tree = {tuple(q_init): None}
 
         for iteration in range(max_iters):
             q_samp = self.sample(q_goal)
-            q_near = self.nearest(nodes, q_samp)
+            q_near = self.nearest(nodes, n_nodes, q_samp)
             q_new = self.extend(q_near, q_samp, step_size)
 
             if not self.is_collision_free(q_near, q_new, max_step_size=step_size):
                 continue
 
-            nodes = np.vstack([nodes, q_new])
+            nodes[n_nodes] = q_new
+            n_nodes += 1
             tree[tuple(q_new)] = tuple(q_near)
 
             if iteration % 500 == 0:
-                print(f"  RRT iteration {iteration}, nodes: {len(nodes)}")
+                print(f"  RRT iteration {iteration}, nodes: {n_nodes}")
 
-            if np.linalg.norm(q_new - q_goal) <= threshold:
-                path = self.retrace(q_new, tree)
-                if smooth:
-                    path = self.smooth(path)
-                print(f"RRT found path with {len(path)} waypoints in {iteration} iterations")
-                return path
+            # Check if this new node is close enough to connect directly to goal
+            if np.linalg.norm(q_new - q_goal) <= step_size:
+                if self.is_collision_free(q_new, q_goal):
+                    tree[tuple(q_goal)] = tuple(q_new)
+                    path = self.retrace(q_goal, tree)
+                    if smooth:
+                        path = self.smooth(path)
+                    print(f"RRT found path with {len(path)} waypoints in {iteration} iterations")
+                    return path
 
-        print(f"RRT failed after {max_iters} iterations ({len(nodes)} nodes explored)")
+        print(f"RRT failed after {max_iters} iterations ({n_nodes} nodes explored)")
         return None

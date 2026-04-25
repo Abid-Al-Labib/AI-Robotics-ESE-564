@@ -25,15 +25,15 @@ class Perception:
         return rgb, depth
 
     def find_object_pixel(self, rgb, target_color, threshold=50):
-            """Find topmost pixel of an object by color."""
+            """Find object pixel: topmost y, midpoint x between leftmost and rightmost match."""
             diff = np.linalg.norm(rgb.astype(float) - np.array(target_color), axis=2)
             mask = diff < threshold
             ys, xs = np.where(mask)
             if len(xs) == 0:
                 return None
-            # Topmost = smallest y value (pixel y=0 is top of image)
-            top_idx = np.argmin(ys)
-            return int(xs[top_idx]), int(ys[top_idx])
+            mid_x = int((xs.min() + xs.max()) / 2)
+            top_y = int(ys.min())
+            return mid_x, top_y
 
     def pixel_to_world(self, pixel_x, pixel_y, depth_img):
             fovy = self.model.cam_fovy[self.cam_id]

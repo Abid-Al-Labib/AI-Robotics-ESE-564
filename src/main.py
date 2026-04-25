@@ -10,6 +10,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from environment.mujoco_env import MujocoEnv
 from pipeline.controller.kinematics import Kinematics
+from pipeline.controller.gripper_controls import GripperController
+from pipeline.controller.arm_controller import ArmController
 from pipeline.perception.perception import Perception
 from pipeline.planner.rrt_planner import RRTPlanner
 
@@ -60,10 +62,16 @@ def get_ik_goal(kin, target_pos, planner):
 
 
 def execute_path(env, waypoints, viewer, delay=0.3):
-    """Execute a list of joint-space waypoints with animation."""
+    """Execute a list of joint-space waypoints with animation (kinematic)."""
     for wp in waypoints:
         set_joints(env, wp, viewer)
         wait(viewer, delay)
+
+
+def execute_path_motor(arm, waypoints, viewer):
+    """Execute a list of joint-space waypoints using motor controls (physics)."""
+    for wp in waypoints:
+        arm.move_to(wp, viewer)
 
 
 def wait(viewer, seconds):
@@ -81,9 +89,11 @@ def main():
     kin = Kinematics()
     perception = Perception(env.model, env.data)
     planner = RRTPlanner(env.model, env.data)
+    gripper = GripperController(env.model, env.data)
+    arm = ArmController(env.model, env.data)
 
     # Generate random configurations
-    num_trials = 3
+    num_trials = 10
     obj_positions, goal_positions = env.generate_random_configs(num_trials)
     print(f"Generated {num_trials} random configurations")
 
@@ -107,27 +117,35 @@ def main():
             print(f"Perceived pick: {pick_pos}")
             print(f"Perceived place: {place_pos}")
 
-            # Plan and move to pick position
+            # Move to pick approach (0.15 m above object) and test gripper
             if pick_pos is not None:
-                print("\nPlanning path to PICK position...")
-                q_pick = get_ik_goal(kin, pick_pos, planner)
-                if q_pick is not None:
-                    path = planner.plan(q_pick)
+                print("\nPlanning path to PICK APPROACH...")
+                q_pick_approach = get_ik_goal(kin, pick_pos, planner)
+                if q_pick_approach is not None:
+                    path = planner.plan(q_pick_approach)
                     if path:
-                        print("Executing path to pick...")
-                        execute_path(env, path, viewer)
+                        print("Executing path to pick approach...")
+                        execute_path_motor(arm, path, viewer)
+                        print("Testing gripper open/close at pick approach...")
+                        gripper.open(viewer)
+                        wait(viewer, 0.5)
+                        gripper.close(viewer)
+                        wait(viewer, 0.5)
+                        arm.move_to(q_pick_approach, viewer)  # recover after gripper physics
 
-            wait(viewer, 2)
+            wait(viewer, 1)
 
-            # Plan and move to place position
+            # Move to place approach (0.15 m above goal) and test gripper
             if place_pos is not None:
-                print("\nPlanning path to PLACE position...")
-                q_place = get_ik_goal(kin, place_pos, planner)
-                if q_place is not None:
-                    path = planner.plan(q_place)
+                print("\nPlanning path to PLACE APPROACH...")
+                q_place_approach = get_ik_goal(kin, place_pos, planner)
+                if q_place_approach is not None:
+                    path = planner.plan(q_place_approach)
                     if path:
-                        print("Executing path to place...")
-                        execute_path(env, path, viewer)
+                        print("Executing path to place approach...")
+                        execute_path_motor(arm, path, viewer)
+                        print("Testing gripper open at place approach...")
+                        gripper.open(viewer)
 
             wait(viewer, 2)
 
