@@ -21,11 +21,26 @@ class RRTPlanner:
             ("left_finger", "right_finger"),
             ("link5", "link7"),
             ("link5", "hand"),
+            ("link5", "left_finger"),
+            ("link5", "right_finger"),
         ]
         for name_a, name_b in pairs_to_allow:
             id_a = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name_a)
             id_b = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name_b)
             self.allowed_pairs.add((min(id_a, id_b), max(id_a, id_b)))
+        self.held_object_body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, "pick_object"
+        )
+        self.gripper_body_ids = {
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "hand"),
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "left_finger"),
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"),
+        }
+        self.ignore_held_object = False
+
+    def set_ignore_held_object(self, ignore):
+        """Ignore gripper-object contacts while planning with a grasped object."""
+        self.ignore_held_object = ignore
 
     def get_joint_positions(self):
         return self.data.qpos[self.joint_qpos_idx].copy()
@@ -46,10 +61,16 @@ class RRTPlanner:
         if pair in self.allowed_pairs:
             return False
 
+        if self.ignore_held_object and self.held_object_body_id in (body1, body2):
+            other = body2 if body1 == self.held_object_body_id else body1
+            if other in self.gripper_body_ids:
+                return False
+
         return True
 
     def is_config_valid(self, q, debug=False):
         q_orig = self.get_joint_positions()
+        qvel_orig = self.data.qvel.copy()
         self.set_joint_positions(q)
         mujoco.mj_collision(self.model, self.data)
 
@@ -67,10 +88,12 @@ class RRTPlanner:
                     break
 
         self.set_joint_positions(q_orig)
+        self.data.qvel[:] = qvel_orig
         return not colliding
 
     def is_collision_free(self, q1, q2, max_step_size=0.1):
         q_orig = self.get_joint_positions()
+        qvel_orig = self.data.qvel.copy()
 
         delta = q2 - q1
         dist = np.linalg.norm(delta)
@@ -83,9 +106,11 @@ class RRTPlanner:
             for i in range(self.data.ncon):
                 if self.data.contact[i].dist < 0 and self._is_robot_collision(self.data.contact[i]):
                     self.set_joint_positions(q_orig)
+                    self.data.qvel[:] = qvel_orig
                     return False
 
         self.set_joint_positions(q_orig)
+        self.data.qvel[:] = qvel_orig
         return True
 
     def sample(self, q_goal, epsilon=0.1):

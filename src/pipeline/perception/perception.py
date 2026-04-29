@@ -35,6 +35,17 @@ class Perception:
             top_y = int(ys.min())
             return mid_x, top_y
 
+    def find_object_center_pixel(self, rgb, target_color, threshold=50):
+            """Find the center of a colored object's image-space bounding box."""
+            diff = np.linalg.norm(rgb.astype(float) - np.array(target_color), axis=2)
+            mask = diff < threshold
+            ys, xs = np.where(mask)
+            if len(xs) == 0:
+                return None
+            mid_x = int((xs.min() + xs.max()) / 2)
+            mid_y = int((ys.min() + ys.max()) / 2)
+            return mid_x, mid_y
+
     def pixel_to_world(self, pixel_x, pixel_y, depth_img):
             fovy = self.model.cam_fovy[self.cam_id]
             f = 0.5 * self.height / np.tan(np.radians(fovy / 2))
@@ -63,7 +74,7 @@ class Perception:
     def get_pick_object_position(self, rgb=None, depth=None):
         if rgb is None or depth is None:
             rgb, depth = self.render()
-        red_pixel = self.find_object_pixel(rgb, [230, 38, 38])
+        red_pixel = self.find_object_center_pixel(rgb, [230, 38, 38])
         if red_pixel is None:
             return None
         return self.pixel_to_world(red_pixel[0], red_pixel[1], depth)
@@ -71,7 +82,7 @@ class Perception:
     def get_goal_position(self, rgb=None, depth=None):
         if rgb is None or depth is None:
             rgb, depth = self.render()
-        green_pixel = self.find_object_pixel(rgb, [26, 217, 26])
+        green_pixel = self.find_object_center_pixel(rgb, [26, 217, 26])
         if green_pixel is None:
             return None
         return self.pixel_to_world(green_pixel[0], green_pixel[1], depth)
