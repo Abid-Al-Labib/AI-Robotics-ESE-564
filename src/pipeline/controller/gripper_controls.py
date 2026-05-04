@@ -12,28 +12,25 @@ class GripperController:
         self.act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "actuator8")
         j1_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint1")
         self.finger_qidx = model.jnt_qposadr[j1_id]
+        self._arm_act_ids = [
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"actuator{i+1}")
+            for i in range(7)
+        ]
+        self._arm_qpos_idx = [
+            model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i+1}")]
+            for i in range(7)
+        ]
 
     def _hold_arm(self):
-        """Snapshot current arm qpos so _step_until_settled can re-lock it each frame."""
-        self._arm_lock = []
-        for i in range(7):
-            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i+1}")
-            qidx = self.model.jnt_qposadr[jid]
-            vidx = self.model.jnt_dofadr[jid]
-            self._arm_lock.append((qidx, vidx, float(self.data.qpos[qidx])))
-
-    def _relock_arm(self):
-        """Pin arm back to snapshot — called before each physics frame to cancel gravity drift."""
-        for qidx, vidx, target in self._arm_lock:
-            self.data.qpos[qidx] = target
-            self.data.qvel[vidx] = 0.0
+        """Command arm actuators to hold their current joint positions."""
+        for act_id, qidx in zip(self._arm_act_ids, self._arm_qpos_idx):
+            self.data.ctrl[act_id] = float(self.data.qpos[qidx])
 
     def _step_until_settled(self, viewer, steps_per_frame=10, max_frames=200):
         prev = float(self.data.qpos[self.finger_qidx])
         for _ in range(max_frames):
             for _ in range(steps_per_frame):
                 mujoco.mj_step(self.model, self.data)
-                self._relock_arm()      # snap arm back after every step, not just per frame
             viewer.sync()
             curr = float(self.data.qpos[self.finger_qidx])
             if abs(curr - prev) < 1e-5:

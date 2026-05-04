@@ -68,9 +68,9 @@ class RLLocalPickController:
         success = False
 
         for step_count in range(self.config.max_episode_steps):
-            obs = self._get_obs(initial_object_z, step_count)
+            obs = self._get_obs(initial_object_z)
             action, _ = self.policy.predict(obs, deterministic=True)
-            self._apply_action(action, step_count)
+            self._apply_action(action)
 
             for _ in range(self.config.frame_skip):
                 mujoco.mj_step(self.model, self.data)
@@ -83,25 +83,26 @@ class RLLocalPickController:
 
         return bool(success)
 
-    def _apply_action(self, action, step_count: int) -> None:
+    def _apply_action(self, action) -> None:
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, -1.0, 1.0)
-        q_target = self._joint_positions() + action * self.config.action_scale
+        joint_action = action[:7]
+        gripper_cmd = float(action[7])
+
+        q_target = self._joint_positions() + joint_action * self.config.action_scale
         q_target = np.clip(q_target, self.joint_limits[:, 0], self.joint_limits[:, 1])
 
         for act_id, value in zip(self.actuator_ids, q_target):
             self.data.ctrl[act_id] = float(value)
 
         self.data.ctrl[self.gripper_actuator_id] = (
-            self.config.open_gripper_ctrl
-            if step_count < self.config.gripper_close_step
-            else self.config.close_gripper_ctrl
+            self.config.close_gripper_ctrl if gripper_cmd > 0 else self.config.open_gripper_ctrl
         )
 
-    def _get_obs(self, initial_object_z: float, step_count: int) -> np.ndarray:
+    def _get_obs(self, initial_object_z: float) -> np.ndarray:
         object_pos = self._object_pos()
         ee_pos = self._ee_pos()
-        phase = 0.0 if step_count < self.config.gripper_close_step else 1.0
+        phase = 0.0 if self._gripper_opening() > 0.01 else 1.0
         obs = np.concatenate([
             self._joint_positions(),
             self._joint_velocities(),

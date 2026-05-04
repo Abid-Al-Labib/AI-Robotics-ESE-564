@@ -10,14 +10,14 @@ class MujocoEnv:
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
-        # Table bounds with margin
-        self.table_x_min = 0.35
-        self.table_x_max = 0.65
-        self.pick_y_min = -0.24
-        self.pick_y_max = -0.08
-        self.goal_y_min = 0.08
+        # Table bounds — object side centered, goal side opposite
+        self.table_x_min = 0.43
+        self.table_x_max = 0.57
+        self.pick_y_min = -0.20
+        self.pick_y_max = -0.10
+        self.goal_y_min = 0.10
         self.goal_y_max = 0.24
-        self.pick_z = 0.13
+        self.pick_z = 0.125
         self.goal_z = 0.1
         self.min_dist = 0.10
 
@@ -100,9 +100,9 @@ class MujocoEnv:
         self.data.qvel[:] = 0.0
         self._reset_robot_home()
 
-        # Set pick object (freejoint: x, y, z, qw, qx, qy, qz)
+        # Set pick object lying on its side (90deg rotation around Y axis)
         self.data.qpos[self.pick_qpos_idx:self.pick_qpos_idx + 3] = obj_pos
-        self.data.qpos[self.pick_qpos_idx + 3:self.pick_qpos_idx + 7] = [1, 0, 0, 0]
+        self.data.qpos[self.pick_qpos_idx + 3:self.pick_qpos_idx + 7] = [0.7071, 0.7071, 0, 0]
 
         # Set goal platform (freejoint: x, y, z, qw, qx, qy, qz)
         self.data.qpos[self.goal_qpos_idx:self.goal_qpos_idx + 3] = goal_pos

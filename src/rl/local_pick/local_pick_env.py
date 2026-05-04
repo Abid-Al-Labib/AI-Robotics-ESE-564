@@ -90,7 +90,29 @@ class LocalPickEnv(gym.Env):
             self.model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"
         )
 
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
+        _robot_link_names = [
+            "link0", "link1", "link2", "link3", "link4",
+            "link5", "link6", "link7", "hand", "left_finger", "right_finger",
+        ]
+        self.robot_body_ids = frozenset(
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, n)
+            for n in _robot_link_names
+        )
+
+        self.object_geom_ids = frozenset(
+            i for i in range(self.model.ngeom)
+            if self.model.geom_bodyid[i] == self.object_body_id
+        )
+        self.left_finger_geom_ids = frozenset(
+            i for i in range(self.model.ngeom)
+            if self.model.geom_bodyid[i] == self.left_finger_body_id
+        )
+        self.right_finger_geom_ids = frozenset(
+            i for i in range(self.model.ngeom)
+            if self.model.geom_bodyid[i] == self.right_finger_body_id
+        )
+
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
 
         self.step_count = 0
@@ -138,19 +160,22 @@ class LocalPickEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
+        joint_action = action[:7]
+        gripper_cmd = float(action[7])
+
         q_current = self._joint_positions()
-        q_target = q_current + action * self.config.action_scale
+        q_target = q_current + joint_action * self.config.action_scale
         q_target = np.clip(q_target, self.joint_limits[:, 0], self.joint_limits[:, 1])
 
         self._command_arm(q_target)
-        self._set_gripper(open_gripper=self.step_count < self.config.gripper_close_step)
+        self._set_gripper(open_gripper=(gripper_cmd <= 0))
 
         for _ in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
 
         self.step_count += 1
         obs = self._get_obs()
-        reward, reward_info = self._compute_reward(action)
+        reward, reward_info = self._compute_reward(joint_action, gripper_cmd)
         success = self._is_success()
         terminated = success
         truncated = self.step_count >= self.config.max_episode_steps
@@ -189,19 +214,37 @@ class LocalPickEnv(gym.Env):
         return base
 
     def _sample_approach_joint_state(self, object_pos: np.ndarray) -> np.ndarray:
-        target_rot = np.array([
-            [1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, -1.0],
-        ])
-        home = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853])
+        if self.config.side_grasp:
+            target_rot = np.array([
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+            ])
+        else:
+            target_rot = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, -1.0],
+            ])
+        if self.config.side_grasp:
+            home = np.array([0.0, 0.3, 0.0, -1.0, 0.0, 1.3, 1.5708])
+        else:
+            home = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853])
 
         for _ in range(50):
             approach_pos = object_pos.copy()
-            approach_pos[2] += self.config.approach_height
+            if self.config.side_grasp:
+                approach_pos[0] -= self.config.side_approach_offset
+                approach_pos[2] += self.config.side_grasp_height
+            else:
+                approach_pos[2] += self.config.approach_height
             if self.config.approach_xy_noise > 0:
                 approach_pos[:2] += self.rng.uniform(
                     -self.config.approach_xy_noise, self.config.approach_xy_noise, size=2
+                )
+            if self.config.approach_z_noise > 0:
+                approach_pos[2] += self.rng.uniform(
+                    -self.config.approach_z_noise, self.config.approach_z_noise
                 )
 
             solutions = self.kinematics.ik(approach_pos, target_rot, free_joint_samples=100)
@@ -222,7 +265,7 @@ class LocalPickEnv(gym.Env):
 
     def _set_object_pose(self, object_pos: np.ndarray) -> None:
         self.data.qpos[self.object_qpos_idx:self.object_qpos_idx + 3] = object_pos
-        self.data.qpos[self.object_qpos_idx + 3:self.object_qpos_idx + 7] = [1.0, 0.0, 0.0, 0.0]
+        self.data.qpos[self.object_qpos_idx + 3:self.object_qpos_idx + 7] = [0.7071, 0.7071, 0.0, 0.0]
 
     def _set_arm_state(self, q: np.ndarray) -> None:
         self.data.qpos[self.qpos_idx] = q
@@ -262,7 +305,7 @@ class LocalPickEnv(gym.Env):
         return float(self.data.qpos[self.finger_qpos_idx])
 
     def _phase(self) -> float:
-        return 0.0 if self.step_count < self.config.gripper_close_step else 1.0
+        return 0.0 if self._gripper_opening() > 0.01 else 1.0
 
     def _get_obs(self) -> np.ndarray:
         object_pos = self._object_pos()
@@ -277,18 +320,60 @@ class LocalPickEnv(gym.Env):
         ])
         return obs.astype(np.float32)
 
-    def _compute_reward(self, action: np.ndarray) -> tuple[float, dict[str, float]]:
+    def _finger_object_contact(self) -> tuple[bool, bool]:
+        left_touch = False
+        right_touch = False
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if (g1 in self.left_finger_geom_ids and g2 in self.object_geom_ids) or \
+               (g2 in self.left_finger_geom_ids and g1 in self.object_geom_ids):
+                left_touch = True
+            if (g1 in self.right_finger_geom_ids and g2 in self.object_geom_ids) or \
+               (g2 in self.right_finger_geom_ids and g1 in self.object_geom_ids):
+                right_touch = True
+        return left_touch, right_touch
+
+    def _compute_reward(self, joint_action: np.ndarray, gripper_cmd: float) -> tuple[float, dict[str, float]]:
         object_pos = self._object_pos()
         ee_pos = self._ee_pos()
         reach_distance = float(np.linalg.norm(ee_pos - object_pos))
         object_lift = float(max(0.0, object_pos[2] - self.initial_object_z))
-        action_penalty = float(np.linalg.norm(action) ** 2)
+        action_penalty = float(np.linalg.norm(joint_action) ** 2)
         table_penalty = self._table_collision_penalty()
         success = self._is_success()
+        left_touch, right_touch = self._finger_object_contact()
+        both_touching = left_touch and right_touch
+
+        # Reward closing when well-aligned (tightened threshold)
+        align_close_bonus = 0.0
+        if gripper_cmd > 0 and reach_distance <= self.config.align_close_threshold:
+            align_close_bonus = self.config.align_close_bonus
+
+        # Penalize closing when clearly not aligned yet
+        premature_close_penalty = 0.0
+        if gripper_cmd > 0 and reach_distance > self.config.premature_close_threshold:
+            premature_close_penalty = self.config.premature_close_penalty
+
+        # Reward both fingers physically contacting the object while closing
+        contact_bonus = 0.0
+        if gripper_cmd > 0 and both_touching:
+            contact_bonus = self.config.contact_reward
+
+        # Reward holding the object up — scales linearly with lift height
+        hold_bonus = 0.0
+        if both_touching and object_lift >= self.config.hold_lift_threshold:
+            required_lift = max(self.config.lift_success_z - self.initial_object_z, 0.001)
+            lift_fraction = min(object_lift / required_lift, 1.0)
+            hold_bonus = self.config.hold_reward * lift_fraction
 
         reward = (
             -self.config.reach_weight * reach_distance
             + self.config.lift_weight * object_lift
+            + align_close_bonus
+            + contact_bonus
+            + hold_bonus
+            - premature_close_penalty
             - self.config.action_penalty_weight * action_penalty
             - table_penalty
         )
@@ -300,16 +385,23 @@ class LocalPickEnv(gym.Env):
             "object_lift": object_lift,
             "action_penalty": action_penalty,
             "table_penalty": table_penalty,
+            "align_close_bonus": align_close_bonus,
+            "contact_bonus": contact_bonus,
+            "hold_bonus": hold_bonus,
+            "premature_close_penalty": premature_close_penalty,
         }
 
     def _table_collision_penalty(self) -> float:
-        table_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "table")
-        robot_body_ids = set(range(1, 12))
+        obstacle_bodies = {
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "table"),
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "center_obstacle"),
+        }
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             body1 = self.model.geom_bodyid[contact.geom1]
             body2 = self.model.geom_bodyid[contact.geom2]
-            if table_body_id in (body1, body2) and (body1 in robot_body_ids or body2 in robot_body_ids):
+            if (body1 in obstacle_bodies or body2 in obstacle_bodies) and \
+               (body1 in self.robot_body_ids or body2 in self.robot_body_ids):
                 return self.config.table_collision_penalty
         return 0.0
 

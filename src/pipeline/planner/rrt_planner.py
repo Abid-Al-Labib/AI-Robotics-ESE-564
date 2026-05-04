@@ -37,6 +37,14 @@ class RRTPlanner:
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"),
         }
         self.ignore_held_object = False
+        _robot_link_names = [
+            "link0", "link1", "link2", "link3", "link4",
+            "link5", "link6", "link7", "hand", "left_finger", "right_finger",
+        ]
+        self.robot_body_ids = frozenset(
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)
+            for n in _robot_link_names
+        )
 
     def set_ignore_held_object(self, ignore):
         """Ignore gripper-object contacts while planning with a grasped object."""
@@ -50,11 +58,10 @@ class RRTPlanner:
         mujoco.mj_forward(self.model, self.data)
 
     def _is_robot_collision(self, contact):
-        robot_bodies = set(range(1, 12))
         body1 = self.model.geom_bodyid[contact.geom1]
         body2 = self.model.geom_bodyid[contact.geom2]
 
-        if body1 not in robot_bodies and body2 not in robot_bodies:
+        if body1 not in self.robot_body_ids and body2 not in self.robot_body_ids:
             return False
 
         pair = (min(body1, body2), max(body1, body2))
@@ -62,9 +69,7 @@ class RRTPlanner:
             return False
 
         if self.ignore_held_object and self.held_object_body_id in (body1, body2):
-            other = body2 if body1 == self.held_object_body_id else body1
-            if other in self.gripper_body_ids:
-                return False
+            return False
 
         return True
 

@@ -10,12 +10,15 @@ class Kinematics:
         rot = np.array(result[1])
         return pos, rot
 
-    def ik(self, target_pos: np.ndarray, target_rot: np.ndarray, free_joint_samples: int = 100):
+    def ik(self, target_pos: np.ndarray, target_rot: np.ndarray,
+           free_joint_samples: int = 100, free_joint_range: np.ndarray | None = None):
         rot_list = target_rot.tolist()
         pos_list = target_pos.tolist()
-        
+
+        if free_joint_range is None:
+            free_joint_range = np.linspace(-2.8, 2.8, free_joint_samples)
+
         solutions = []
-        free_joint_range = np.linspace(-2.8, 2.8, free_joint_samples)
         for free_val in free_joint_range:
             result = ikfast.get_ik(rot_list, pos_list, [free_val])
             if result:
