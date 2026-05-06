@@ -14,11 +14,11 @@ from rl.local_pick.config import LocalPickConfig
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train SAC for the local pick task.")
+    parser = argparse.ArgumentParser(description="Train SAC for Cartesian local pick.")
     parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--model-path", type=Path, default=Path("models/local_pick_sac"))
-    parser.add_argument("--n-envs", type=int, default=16)
+    parser.add_argument("--model-path", type=Path, default=Path("models/local_pick_cartesian_sac"))
+    parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--object-noise", type=float, default=0.0)
     parser.add_argument("--approach-noise", type=float, default=0.0)
     parser.add_argument("--approach-z-noise", type=float, default=0.0)
@@ -33,23 +33,32 @@ def parse_args():
         action="store_true",
         help="Use side grasp approach instead of top-down.",
     )
+    parser.add_argument(
+        "--dummy-vec",
+        action="store_true",
+        help="Use DummyVecEnv instead of SubprocVecEnv for easier debugging.",
+    )
     return parser.parse_args()
 
 
 def _make_env(config: LocalPickConfig):
-    """Module-level factory so SubprocVecEnv can pickle it on Windows."""
     import sys
+
     if _SRC_ROOT_STR not in sys.path:
         sys.path.insert(0, _SRC_ROOT_STR)
+
     from stable_baselines3.common.monitor import Monitor
-    from rl.local_pick.local_pick_env import LocalPickEnv
-    return Monitor(LocalPickEnv(config=config, render_mode=None))
+    from rl.local_pick.local_pick_cartesian_env import LocalPickCartesianEnv
+
+    return Monitor(LocalPickCartesianEnv(config=config, render_mode=None))
 
 
 def main():
     try:
+        import torch
         from stable_baselines3 import SAC
-        from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+        from stable_baselines3.common.callbacks import CheckpointCallback
+        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
     except ImportError as exc:
         raise ImportError(
             "Training requires stable-baselines3. Install dependencies with "
@@ -68,41 +77,50 @@ def main():
     )
 
     env_fns = [partial(_make_env, config) for _ in range(args.n_envs)]
-    try:
-        env = SubprocVecEnv(env_fns)
-        print(f"Using SubprocVecEnv with {args.n_envs} parallel environments.")
-    except Exception as e:
-        print(f"SubprocVecEnv failed ({e}), falling back to DummyVecEnv.")
+    if args.dummy_vec:
         env = DummyVecEnv(env_fns)
+        print(f"Using DummyVecEnv with {args.n_envs} environments.")
+    else:
+        try:
+            env = SubprocVecEnv(env_fns)
+            print(f"Using SubprocVecEnv with {args.n_envs} parallel environments.")
+        except Exception as e:
+            print(f"SubprocVecEnv failed ({e}), falling back to DummyVecEnv.")
+            env = DummyVecEnv(env_fns)
 
+    env = VecNormalize(env, norm_obs=True, norm_reward=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = SAC(
         "MlpPolicy",
         env,
         verbose=1,
         seed=args.seed,
-        device="cuda",
+        device=device,
         learning_rate=3e-4,
         buffer_size=1_000_000,
-        batch_size=512,
+        batch_size=256,
         gamma=0.99,
         tau=0.005,
         train_freq=1,
-        gradient_steps=8,
-        learning_starts=5_000,
+        gradient_steps=1,
+        learning_starts=2_000,
         use_sde=True,
         sde_sample_freq=4,
     )
-    from stable_baselines3.common.callbacks import CheckpointCallback
+
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_cb = CheckpointCallback(
         save_freq=max(50_000 // args.n_envs, 1),
         save_path=str(args.model_path.parent),
         name_prefix=args.model_path.name,
     )
+
     model.learn(total_timesteps=args.timesteps, callback=checkpoint_cb)
     model.save(args.model_path)
+    env.save(str(args.model_path.with_name(args.model_path.name + "_vecnormalize.pkl")))
     env.close()
-    print(f"Saved local pick model to {args.model_path}")
+    print(f"Saved Cartesian local pick model to {args.model_path}")
 
 
 if __name__ == "__main__":

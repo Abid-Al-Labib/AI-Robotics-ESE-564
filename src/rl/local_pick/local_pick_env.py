@@ -114,12 +114,12 @@ class LocalPickEnv(gym.Env):
 
         # Camera-based perception
         self._render_h, self._render_w = 120, 160
-        self._cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "perception_cam")
+        self._cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam")
         self._renderer = mujoco.Renderer(self.model, height=self._render_h, width=self._render_w)
         self._cam_object_pos: np.ndarray | None = None
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(19,), dtype=np.float32)
 
         self.step_count = 0
         self.initial_object_z = self.config.object_z
@@ -155,14 +155,14 @@ class LocalPickEnv(gym.Env):
         self._set_gripper_state(open_gripper=True)
         mujoco.mj_forward(self.model, self.data)
 
-        # Bootstrap perception from camera; fall back to ground-truth z if detection fails.
+        # Bootstrap camera perception for observations.
         self._cam_object_pos = None
         cam_pos = self._render_object_pos()
         if cam_pos is not None:
             self._cam_object_pos = cam_pos
-            self.initial_object_z = float(cam_pos[2])
-        else:
-            self.initial_object_z = float(object_pos[2])
+
+        # GT physics position used only for reward/success — not exposed to policy.
+        self.initial_object_z = float(self.data.xpos[self.object_body_id][2])
 
         obs = self._get_obs()
         info = {"object_pos": self._object_pos().copy(), "success": False}
@@ -346,8 +346,8 @@ class LocalPickEnv(gym.Env):
         points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
         points_world = cam_pos + points_cam @ cam_rot.T
         com = points_world.mean(axis=0)
-        com[2] -= 0.029  # camera sees top surface only; correct for occluded bottom half
-        com[1] += 0.009  # systematic camera angle bias in Y
+        com[2] -= 0.0235  # wrist cam sees top surface; correct for bottle half-height
+        com[1] -= 0.010   # wrist cam systematic Y bias (constant across all positions)
         return com
 
     def _pixel_to_world(self, px: int, py: int, depth: np.ndarray) -> np.ndarray:
@@ -385,7 +385,6 @@ class LocalPickEnv(gym.Env):
             ee_pos - object_pos,
             np.array([object_pos[2] - self.initial_object_z], dtype=float),
             np.array([self._gripper_opening()], dtype=float),
-            np.array([self._phase()], dtype=float),
         ])
         return obs.astype(np.float32)
 
@@ -407,7 +406,8 @@ class LocalPickEnv(gym.Env):
         object_pos = self._object_pos()
         ee_pos = self._ee_pos()
         reach_distance = float(np.linalg.norm(ee_pos - object_pos))
-        object_lift = float(max(0.0, object_pos[2] - self.initial_object_z))
+        # GT physics lift — camera can't see the bottle once gripper closes around it.
+        object_lift = float(max(0.0, self.data.xpos[self.object_body_id][2] - self.initial_object_z))
         action_penalty = float(np.linalg.norm(joint_action) ** 2)
         table_penalty = self._table_collision_penalty()
         success = self._is_success()
@@ -474,5 +474,5 @@ class LocalPickEnv(gym.Env):
         return 0.0
 
     def _is_success(self) -> bool:
-        return bool(self._object_pos()[2] - self.initial_object_z >= self.config.min_lift_for_success)
+        return bool(self.data.xpos[self.object_body_id][2] - self.initial_object_z >= self.config.min_lift_for_success)
 

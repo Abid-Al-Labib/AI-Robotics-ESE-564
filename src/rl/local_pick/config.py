@@ -43,11 +43,11 @@ class LocalPickConfig:
     success_bonus: float = 200.0
     action_penalty_weight: float = 0.01
     table_collision_penalty: float = 2.0
-    align_close_bonus: float = 2.0
-    align_close_threshold: float = 0.015
-    premature_close_penalty: float = 5.0
-    premature_close_threshold: float = 0.06
-    contact_reward: float = 2.0
+    align_close_bonus: float = 0.0
+    align_close_threshold: float = 0.05
+    premature_close_penalty: float = 0.5
+    premature_close_threshold: float = 0.10
+    contact_reward: float = 1.0
     hold_reward: float = 5.0
     hold_lift_threshold: float = 0.01
 
