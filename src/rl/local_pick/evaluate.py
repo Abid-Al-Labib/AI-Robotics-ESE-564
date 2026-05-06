@@ -43,7 +43,7 @@ def main():
     args = parse_args()
     config = LocalPickConfig(
         seed=args.seed,
-        fixed_object_position=None if args.full_table_random else (0.4, -0.15, 0.13),
+        fixed_object_position=None if args.full_table_random else (0.5, -0.15, 0.125),
         object_xy_noise=args.object_noise,
         approach_xy_noise=args.approach_noise,
         approach_z_noise=args.approach_z_noise,

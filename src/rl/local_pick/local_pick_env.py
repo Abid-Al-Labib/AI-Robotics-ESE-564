@@ -112,12 +112,17 @@ class LocalPickEnv(gym.Env):
             if self.model.geom_bodyid[i] == self.right_finger_body_id
         )
 
+        # Camera-based perception
+        self._render_h, self._render_w = 120, 160
+        self._cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "perception_cam")
+        self._renderer = mujoco.Renderer(self.model, height=self._render_h, width=self._render_w)
+        self._cam_object_pos: np.ndarray | None = None
+
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
 
         self.step_count = 0
         self.initial_object_z = self.config.object_z
-        self.last_object_pos = np.zeros(3)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
@@ -145,12 +150,19 @@ class LocalPickEnv(gym.Env):
             raise RuntimeError("Could not sample an IK-reachable local-pick approach pose.")
 
         self._set_object_pose(object_pos)
-        self.initial_object_z = float(object_pos[2])
-
         self._set_arm_state(q_start)
         self._set_gripper(open_gripper=True)
         self._set_gripper_state(open_gripper=True)
         mujoco.mj_forward(self.model, self.data)
+
+        # Bootstrap perception from camera; fall back to ground-truth z if detection fails.
+        self._cam_object_pos = None
+        cam_pos = self._render_object_pos()
+        if cam_pos is not None:
+            self._cam_object_pos = cam_pos
+            self.initial_object_z = float(cam_pos[2])
+        else:
+            self.initial_object_z = float(object_pos[2])
 
         obs = self._get_obs()
         info = {"object_pos": self._object_pos().copy(), "success": False}
@@ -172,6 +184,11 @@ class LocalPickEnv(gym.Env):
 
         for _ in range(self.config.frame_skip):
             mujoco.mj_step(self.model, self.data)
+
+        # Render once per step — shared by obs, reward, and success check.
+        pos = self._render_object_pos()
+        if pos is not None:
+            self._cam_object_pos = pos
 
         self.step_count += 1
         obs = self._get_obs()
@@ -196,6 +213,7 @@ class LocalPickEnv(gym.Env):
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None
+        self._renderer.close()
 
     def _sample_object_position(self) -> np.ndarray:
         if self.config.fixed_object_position is None:
@@ -293,8 +311,59 @@ class LocalPickEnv(gym.Env):
     def _joint_velocities(self) -> np.ndarray:
         return self.data.qvel[self.qvel_idx].copy()
 
+    def _render_object_pos(self) -> np.ndarray | None:
+        """Estimate object CoM from camera RGB+depth by averaging all detected 3D points."""
+        self._renderer.update_scene(self.data, camera=self._cam_id)
+        rgb = self._renderer.render().copy()
+        self._renderer.enable_depth_rendering()
+        self._renderer.update_scene(self.data, camera=self._cam_id)
+        depth = self._renderer.render().copy()
+        self._renderer.disable_depth_rendering()
+
+        target = np.array([230, 38, 38], dtype=float)
+        diff = np.linalg.norm(rgb.astype(float) - target, axis=2)
+        ys, xs = np.where(diff < 50)
+        if len(xs) == 0:
+            return None
+        return self._perception_com(xs, ys, depth)
+
+    def _perception_com(self, xs: np.ndarray, ys: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        """Unproject every detected pixel to 3D and return their mean (true CoM estimate).
+
+        A fixed -0.029m z correction compensates for the camera only seeing the top
+        surface of the bottle — the occluded bottom half biases the raw estimate high.
+        """
+        fovy = self.model.cam_fovy[self._cam_id]
+        f = 0.5 * self._render_h / np.tan(np.radians(fovy / 2))
+        cx, cy = self._render_w / 2.0, self._render_h / 2.0
+        cam_pos = self.data.cam_xpos[self._cam_id]
+        cam_rot = self.data.cam_xmat[self._cam_id].reshape(3, 3)
+
+        d = depth[ys, xs].astype(float)
+        x_cam = (xs - cx) * d / f
+        y_cam = -(ys - cy) * d / f
+        z_cam = -d
+        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
+        points_world = cam_pos + points_cam @ cam_rot.T
+        com = points_world.mean(axis=0)
+        com[2] -= 0.029  # camera sees top surface only; correct for occluded bottom half
+        com[1] += 0.009  # systematic camera angle bias in Y
+        return com
+
+    def _pixel_to_world(self, px: int, py: int, depth: np.ndarray) -> np.ndarray:
+        fovy = self.model.cam_fovy[self._cam_id]
+        f = 0.5 * self._render_h / np.tan(np.radians(fovy / 2))
+        d = float(depth[py, px])
+        cx, cy = self._render_w / 2.0, self._render_h / 2.0
+        x_cam = (px - cx) * d / f
+        y_cam = -(py - cy) * d / f
+        z_cam = -d
+        cam_pos = self.data.cam_xpos[self._cam_id]
+        cam_rot = self.data.cam_xmat[self._cam_id].reshape(3, 3)
+        return cam_pos + cam_rot @ np.array([x_cam, y_cam, z_cam])
+
     def _object_pos(self) -> np.ndarray:
-        return self.data.xpos[self.object_body_id].copy()
+        return self._cam_object_pos.copy() if self._cam_object_pos is not None else np.zeros(3)
 
     def _ee_pos(self) -> np.ndarray:
         left = self.data.xpos[self.left_finger_body_id]
@@ -363,8 +432,7 @@ class LocalPickEnv(gym.Env):
         # Reward holding the object up — scales linearly with lift height
         hold_bonus = 0.0
         if both_touching and object_lift >= self.config.hold_lift_threshold:
-            required_lift = max(self.config.lift_success_z - self.initial_object_z, 0.001)
-            lift_fraction = min(object_lift / required_lift, 1.0)
+            lift_fraction = min(object_lift / self.config.min_lift_for_success, 1.0)
             hold_bonus = self.config.hold_reward * lift_fraction
 
         reward = (
@@ -406,5 +474,5 @@ class LocalPickEnv(gym.Env):
         return 0.0
 
     def _is_success(self) -> bool:
-        return bool(self._object_pos()[2] >= self.config.lift_success_z)
+        return bool(self._object_pos()[2] - self.initial_object_z >= self.config.min_lift_for_success)
 

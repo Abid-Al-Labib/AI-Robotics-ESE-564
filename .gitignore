@@ -26,3 +26,5 @@ outputs/images/*
 outputs/logs/*
 outputs/eval_results/*
 !outputs/**/.gitkeep
+
+claude/

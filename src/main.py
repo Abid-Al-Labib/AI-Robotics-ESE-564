@@ -132,7 +132,7 @@ def main():
     planner = RRTPlanner(env.model, env.data)
     gripper = GripperController(env.model, env.data)
     arm = ArmController(env.model, env.data)
-    local_pick_model_path = project_root / "models" / "privileged_model_v1.zip"
+    local_pick_model_path = project_root / "models" / "perception_model_v1.zip"
     local_pick = None
     if local_pick_model_path.exists():
         local_pick = RLLocalPickController(env.model, env.data, local_pick_model_path)

@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model-path", type=Path, default=Path("models/local_pick_sac"))
-    parser.add_argument("--n-envs", type=int, default=8)
+    parser.add_argument("--n-envs", type=int, default=16)
     parser.add_argument("--object-noise", type=float, default=0.0)
     parser.add_argument("--approach-noise", type=float, default=0.0)
     parser.add_argument("--approach-z-noise", type=float, default=0.0)
@@ -80,13 +80,14 @@ def main():
         env,
         verbose=1,
         seed=args.seed,
+        device="cuda",
         learning_rate=3e-4,
         buffer_size=1_000_000,
         batch_size=512,
         gamma=0.99,
         tau=0.005,
         train_freq=1,
-        gradient_steps=-1,
+        gradient_steps=8,
         learning_starts=5_000,
         use_sde=True,
         sde_sample_freq=4,

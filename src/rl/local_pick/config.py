@@ -26,7 +26,8 @@ class LocalPickConfig:
     approach_height: float = 0.16
     side_approach_offset: float = 0.10
     side_grasp_height: float = 0.03
-    lift_success_z: float = 0.145
+    lift_success_z: float = 0.145   # kept for reference / pipeline clearance logic
+    min_lift_for_success: float = 0.02  # must rise this many metres above initial camera estimate
 
     # Control.
     max_episode_steps: int = 75
