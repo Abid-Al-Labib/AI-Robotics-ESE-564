@@ -14,11 +14,15 @@ from pipeline.controller.gripper_controls import GripperController
 from pipeline.controller.arm_controller import ArmController
 from pipeline.perception.perception import Perception
 from pipeline.planner.rrt_planner import RRTPlanner
+from pipeline.localPick.rl_pixel_pick import RLPixelPickController
+from pipeline.localPick.rl_cartesian_vertical_pick import RLCartesianVerticalPickController
 from pipeline.localPick.rl_local_pick import RLLocalPickController
 
 
+PICK_POSE_CORRECTION = np.array([0.0, 0.020, -0.026], dtype=float)
 
-def get_ik_goal(kin, target_pos, planner, side_grasp=False, z_offset=0.15):
+
+def get_ik_goal(kin, target_pos, planner, side_grasp=False, z_offset=0.15, free_joint_range=None):
     if side_grasp:
         target_rot = np.array([
             [0, 1, 0],
@@ -34,7 +38,10 @@ def get_ik_goal(kin, target_pos, planner, side_grasp=False, z_offset=0.15):
 
     approach_pos = get_approach_position(target_pos, side_grasp=side_grasp, z_offset=z_offset)
 
-    solutions = kin.ik(approach_pos, target_rot, free_joint_samples=100)
+    if free_joint_range is not None:
+        solutions = kin.ik(approach_pos, target_rot, free_joint_range=free_joint_range)
+    else:
+        solutions = kin.ik(approach_pos, target_rot, free_joint_samples=100)
     if not solutions:
         print(f"No IK solution for position {approach_pos}")
         return None
@@ -132,13 +139,27 @@ def main():
     planner = RRTPlanner(env.model, env.data)
     gripper = GripperController(env.model, env.data)
     arm = ArmController(env.model, env.data)
+    pixel_pick_model_path = project_root / "models" / "local_pick_drq_2m.zip"
+    cartesian_pick_model_path = project_root / "models" / "local_pick_cartesian_colift_from_zbonus_sac_500k_500000_steps.zip"
+    cartesian_pick_vecnormalize_path = project_root / "models" / "local_pick_cartesian_colift_from_zbonus_sac_500k_vecnormalize.pkl"
     local_pick_model_path = project_root / "models" / "perception_model_v1.zip"
     local_pick = None
-    if local_pick_model_path.exists():
+    if pixel_pick_model_path.exists():
+        local_pick = RLPixelPickController(env.model, env.data, pixel_pick_model_path)
+        print(f"Loaded pixel SAC local pick model: {pixel_pick_model_path}")
+    elif cartesian_pick_model_path.exists():
+        local_pick = RLCartesianVerticalPickController(
+            env.model,
+            env.data,
+            cartesian_pick_model_path,
+            vecnormalize_path=cartesian_pick_vecnormalize_path,
+        )
+        print(f"Loaded Cartesian RL local pick model: {cartesian_pick_model_path}")
+    elif local_pick_model_path.exists():
         local_pick = RLLocalPickController(env.model, env.data, local_pick_model_path)
         print(f"Loaded RL local pick model: {local_pick_model_path}")
     else:
-        print(f"RL local pick model not found: {local_pick_model_path}")
+        print(f"No RL local pick model found.")
         print("Pipeline will still move to pick approach, but will skip RL local pick.")
 
     # Generate random configurations
@@ -166,17 +187,21 @@ def main():
             pick_pos, place_pos = perception.get_object_positions()
             print(f"Perceived pick: {pick_pos}")
             print(f"Perceived place: {place_pos}")
+            pick_pos_for_handoff = None
+            if pick_pos is not None:
+                pick_pos_for_handoff = pick_pos + PICK_POSE_CORRECTION
+                print(f"Corrected pick for handoff: {pick_pos_for_handoff}")
 
             # Move to pick approach, then hand off to RL local pick
-            if pick_pos is not None:
+            if pick_pos_for_handoff is not None:
                 print("\nPlanning path to PICK APPROACH...")
-                q_pick_approach = get_ik_goal(kin, pick_pos, planner, side_grasp=False)
+                q_pick_approach = get_ik_goal(kin, pick_pos_for_handoff, planner, side_grasp=False)
                 if q_pick_approach is not None:
                     path = planner.plan(q_pick_approach)
                     if path:
                         print("Executing path to pick approach...")
                         execute_path_motor(arm, path, viewer)
-                        pick_approach_pos = get_approach_position(pick_pos, side_grasp=False)
+                        pick_approach_pos = get_approach_position(pick_pos_for_handoff, side_grasp=False)
                         retry_goal_if_needed(
                             kin, arm, viewer, q_pick_approach, pick_approach_pos, "PICK APPROACH"
                         )
@@ -191,7 +216,7 @@ def main():
                             if success and place_pos is not None:
                                 # Lift straight up to clear the obstacle before handing to RRT.
                                 print("\nLifting to clearance height...")
-                                clearance_pos = pick_pos.copy()
+                                clearance_pos = pick_pos_for_handoff.copy()
                                 clearance_pos[2] = 0.38
                                 q_clearance = get_ik_goal(kin, clearance_pos, planner, side_grasp=False, z_offset=0.0)
                                 if q_clearance is not None:

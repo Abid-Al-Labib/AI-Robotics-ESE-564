@@ -246,8 +246,10 @@ class LocalPickEnv(gym.Env):
             ])
         if self.config.side_grasp:
             home = np.array([0.0, 0.3, 0.0, -1.0, 0.0, 1.3, 1.5708])
+            target_j7 = 1.5708
         else:
-            home = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853])
+            home = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, 2.8973])
+            target_j7 = 2.8973  # aligned with lying bottle axis (at joint limit)
 
         for _ in range(50):
             approach_pos = object_pos.copy()
@@ -265,11 +267,27 @@ class LocalPickEnv(gym.Env):
                     -self.config.approach_z_noise, self.config.approach_z_noise
                 )
 
-            solutions = self.kinematics.ik(approach_pos, target_rot, free_joint_samples=100)
+            if self.config.random_j7:
+                # Full range so policy learns to handle any wrist rotation the
+                # pipeline might deliver (typically j7 ≈ -0.25 to 2.8973).
+                j7_range = np.linspace(self.joint_limits[-1, 0], self.joint_limits[-1, 1], 100)
+            else:
+                # Dense near limit — fingers align with lying bottle.
+                j7_range = np.linspace(2.50, 2.8973, 100)
+
+            solutions = self.kinematics.ik(approach_pos, target_rot, free_joint_range=j7_range)
             valid = [q for q in solutions if self._within_joint_limits(q)]
+            if not valid:
+                solutions = self.kinematics.ik(approach_pos, target_rot, free_joint_samples=100)
+                valid = [q for q in solutions if self._within_joint_limits(q)]
             if valid:
-                q = min(valid, key=lambda sol: np.linalg.norm(sol - home))
-                q = np.array(q, dtype=float)
+                if self.config.random_j7:
+                    # Pick uniformly at random so j7 is diverse across episodes.
+                    q = np.array(valid[self.rng.integers(len(valid))], dtype=float)
+                else:
+                    # Pick solution closest to desired joint7, then overall home as tiebreak.
+                    q = min(valid, key=lambda sol: (abs(sol[-1] - target_j7), np.linalg.norm(sol - home)))
+                    q = np.array(q, dtype=float)
                 if self.config.joint_noise > 0:
                     q += self.rng.normal(0.0, self.config.joint_noise, size=7)
                     q = np.clip(q, self.joint_limits[:, 0], self.joint_limits[:, 1])

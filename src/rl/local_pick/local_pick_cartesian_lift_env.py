@@ -17,9 +17,11 @@ class LocalPickCartesianLiftEnv(LocalPickCartesianEnv):
     def __init__(self, config: LocalPickConfig | None = None, render_mode: str | None = None):
         super().__init__(config=config, render_mode=render_mode)
         self._was_both_touching = False
+        self._success_hold_count = 0
 
     def reset(self, *args, **kwargs):
         self._was_both_touching = False
+        self._success_hold_count = 0
         return super().reset(*args, **kwargs)
 
     def _compute_reward(self, cart_action: np.ndarray, gripper_cmd: float) -> tuple[float, dict[str, float]]:
@@ -29,9 +31,9 @@ class LocalPickCartesianLiftEnv(LocalPickCartesianEnv):
         object_lift = float(max(0.0, self.data.xpos[self.object_body_id][2] - self.initial_object_z))
         action_penalty = float(np.linalg.norm(cart_action) ** 2)
         table_penalty = self._table_collision_penalty()
-        success = self._is_success()
         left_touch, right_touch = self._finger_object_contact()
         both_touching = left_touch and right_touch
+        success = self._grasp_lift_condition(both_touching=both_touching, object_lift=object_lift)
 
         reach_reward = 1.0 - np.tanh(12.0 * reach_distance)
 
@@ -56,6 +58,10 @@ class LocalPickCartesianLiftEnv(LocalPickCartesianEnv):
         if both_touching and object_lift < 0.003 and self.step_count > 15:
             no_lift_contact_penalty = 0.08
 
+        invalid_lift_penalty = 0.0
+        if object_lift > 0.006 and not both_touching:
+            invalid_lift_penalty = 8.0 * min(object_lift / self.config.min_lift_for_success, 1.0)
+
         premature_close_penalty = 0.0
         if gripper_cmd > 0 and reach_distance > self.config.premature_close_threshold:
             premature_close_penalty = self.config.premature_close_penalty
@@ -67,9 +73,10 @@ class LocalPickCartesianLiftEnv(LocalPickCartesianEnv):
             + grasp_hold_bonus
             + lift_reward
             - no_lift_contact_penalty
+            - invalid_lift_penalty
             - premature_close_penalty
             - self.config.action_penalty_weight * action_penalty
-            - table_penalty
+            - 3.0 * table_penalty
         )
         if success:
             reward += self.config.success_bonus
@@ -85,4 +92,24 @@ class LocalPickCartesianLiftEnv(LocalPickCartesianEnv):
             "hold_bonus": lift_reward,
             "premature_close_penalty": premature_close_penalty,
             "no_lift_contact_penalty": no_lift_contact_penalty,
+            "invalid_lift_penalty": invalid_lift_penalty,
         }
+
+    def _grasp_lift_condition(self, both_touching: bool | None = None, object_lift: float | None = None) -> bool:
+        if both_touching is None:
+            left_touch, right_touch = self._finger_object_contact()
+            both_touching = left_touch and right_touch
+        if object_lift is None:
+            object_lift = float(max(0.0, self.data.xpos[self.object_body_id][2] - self.initial_object_z))
+
+        # 0.035 m allows for a bottle preventing full finger closure (~0.025 m).
+        gripper_not_open = self._gripper_opening() <= 0.035
+        lifted = object_lift >= self.config.min_lift_for_success
+        return bool(both_touching and gripper_not_open and lifted)
+
+    def _is_success(self) -> bool:
+        if self._grasp_lift_condition():
+            self._success_hold_count += 1
+        else:
+            self._success_hold_count = 0
+        return self._success_hold_count >= 3

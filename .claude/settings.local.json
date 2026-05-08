@@ -4,7 +4,10 @@
       "Bash(python -c \"import torch; print\\('CUDA available:', torch.cuda.is_available\\(\\)\\); print\\('PyTorch version:', torch.__version__\\)\")",
       "Bash(python -c \"import torch\")",
       "Bash(pip show *)",
-      "Bash(nvidia-smi)"
+      "Bash(nvidia-smi)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }

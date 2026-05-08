@@ -16,6 +16,9 @@ class LocalPickConfig:
     approach_xy_noise: float = 0.0
     approach_z_noise: float = 0.0
     joint_noise: float = 0.0
+    # Randomise j7 (wrist rotation) uniformly across joint limits each episode so
+    # the policy learns to pick regardless of which j7 the pipeline delivers.
+    random_j7: bool = False
 
     # Scene geometry.
     table_x_min: float = 0.43
@@ -23,7 +26,7 @@ class LocalPickConfig:
     table_y_min: float = -0.20
     table_y_max: float = -0.10
     object_z: float = 0.125
-    approach_height: float = 0.16
+    approach_height: float = 0.20
     side_approach_offset: float = 0.10
     side_grasp_height: float = 0.03
     lift_success_z: float = 0.145   # kept for reference / pipeline clearance logic
