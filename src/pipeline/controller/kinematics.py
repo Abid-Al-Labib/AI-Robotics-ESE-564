@@ -25,3 +25,9 @@ class Kinematics:
                 for sol in result:
                     solutions.append(np.array(sol))
         return solutions
+
+    @staticmethod
+    def approach_position(target_pos: np.ndarray, z_offset: float = 0.15) -> np.ndarray:
+        pos = target_pos.copy()
+        pos[2] += z_offset
+        return pos

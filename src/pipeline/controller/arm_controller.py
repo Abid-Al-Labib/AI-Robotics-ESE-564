@@ -86,3 +86,12 @@ class ArmController:
                 f"final_pos_err={final_pos_err:.4f}, final_vel_err={final_vel_err:.4f}"
             )
         return final_pos_err, final_vel_err
+
+    def execute_path(self, path, viewer, max_joint_step=0.04):
+        for wp in path:
+            pos_err, _ = self.move_to_smooth(wp, viewer, max_joint_step=max_joint_step)
+            if pos_err > 0.08:
+                self.move_to_smooth(
+                    wp, viewer, max_joint_step=0.02,
+                    tol=0.01, vel_tol=0.05, max_steps_per_target=3000,
+                )

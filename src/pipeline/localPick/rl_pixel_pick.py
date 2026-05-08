@@ -13,19 +13,19 @@ if str(SRC_ROOT) not in sys.path:
 from pipeline.controller.kinematics import Kinematics
 from rl.local_pick.config import LocalPickConfig
 
+# Object colour used in the MuJoCo scene (red bottle).
+_OBJ_COLOR = np.array([230, 38, 38], dtype=float)
+_COLOR_THRESH = 50.0
+
 
 class RLPixelPickController:
-    """Run the trained DrQ-style pixel SAC policy in an existing MuJoCo scene.
-
-    Drop-in replacement for RLCartesianVerticalPickController.
-    Observation: 84x84 wrist-cam RGB, 3-frame stack, CHW uint8.
-    Action:      4-D Cartesian delta [dx, dy, dz, gripper] via IK.
-    No obs normalisation needed — policy was trained with norm_obs=False.
-    """
+    """Run the trained DrQ-style pixel SAC policy in an existing MuJoCo scene."""
 
     N_STACK = 3
     PIXEL_H = 84
     PIXEL_W = 84
+    DETECT_H = 120
+    DETECT_W = 160
 
     def __init__(
         self,
@@ -51,7 +51,6 @@ class RLPixelPickController:
         self.policy = SAC.load(model_path, device="auto")
         self.kinematics = Kinematics()
 
-        # IK / joint bookkeeping — same as other Cartesian controllers.
         self.joint_ids = np.array([
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i}")
             for i in range(1, 8)
@@ -76,12 +75,30 @@ class RLPixelPickController:
             model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"
         )
 
-        # Pixel renderer — separate from any viewer so no OpenGL conflict.
+        # Geom sets by body ID — robust to any geom naming in the XML.
+        self._left_finger_geoms = frozenset(
+            i for i in range(model.ngeom)
+            if model.geom_bodyid[i] == self.left_finger_body_id
+        )
+        self._right_finger_geoms = frozenset(
+            i for i in range(model.ngeom)
+            if model.geom_bodyid[i] == self.right_finger_body_id
+        )
+        self._object_geoms = frozenset(
+            i for i in range(model.ngeom)
+            if model.geom_bodyid[i] == self.object_body_id
+        )
+
         self._cam_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_CAMERA, "wrist_cam"
         )
+        # 84x84 renderer for policy observations.
         self._pixel_renderer = mujoco.Renderer(
             model, height=self.PIXEL_H, width=self.PIXEL_W
+        )
+        # 120x160 renderer for camera-based object detection (matches training env).
+        self._detect_renderer = mujoco.Renderer(
+            model, height=self.DETECT_H, width=self.DETECT_W
         )
 
         self._target_ee_pos: np.ndarray | None = None
@@ -119,7 +136,13 @@ class RLPixelPickController:
             frames.pop(0)
             frames.append(self._get_pixel_obs())
 
-            object_lift = float(self.data.xpos[self.object_body_id][2] - initial_object_z)
+            # Try camera-based lift detection first; fall back to physics xpos.
+            cam_z = self._camera_object_z()
+            if cam_z is not None:
+                object_lift = cam_z - initial_object_z
+            else:
+                object_lift = float(self.data.xpos[self.object_body_id][2] - initial_object_z)
+
             left_touch, right_touch = self._finger_contact()
             if object_lift >= self.config.min_lift_for_success and (left_touch or right_touch):
                 success_count += 1
@@ -132,6 +155,7 @@ class RLPixelPickController:
 
     def close(self) -> None:
         self._pixel_renderer.close()
+        self._detect_renderer.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -141,6 +165,38 @@ class RLPixelPickController:
         """Render wrist cam at 84x84, return (84,84,3) uint8 HWC."""
         self._pixel_renderer.update_scene(self.data, camera=self._cam_id)
         return self._pixel_renderer.render().copy()
+
+    def _camera_object_z(self) -> float | None:
+        """Estimate object world-frame Z from 120x160 wrist-cam RGB+depth.
+
+        Returns None if the object is not visible (e.g. fully occluded by gripper).
+        Matches the detection logic used in the training env.
+        """
+        self._detect_renderer.update_scene(self.data, camera=self._cam_id)
+        rgb = self._detect_renderer.render().copy()
+        self._detect_renderer.enable_depth_rendering()
+        self._detect_renderer.update_scene(self.data, camera=self._cam_id)
+        depth = self._detect_renderer.render().copy()
+        self._detect_renderer.disable_depth_rendering()
+
+        diff = np.linalg.norm(rgb.astype(float) - _OBJ_COLOR, axis=2)
+        ys, xs = np.where(diff < _COLOR_THRESH)
+        if len(xs) == 0:
+            return None
+
+        fovy = self.model.cam_fovy[self._cam_id]
+        f = 0.5 * self.DETECT_H / np.tan(np.radians(fovy / 2))
+        cx, cy = self.DETECT_W / 2.0, self.DETECT_H / 2.0
+        cam_pos = self.data.cam_xpos[self._cam_id]
+        cam_rot = self.data.cam_xmat[self._cam_id].reshape(3, 3)
+
+        d = depth[ys, xs].astype(float)
+        x_cam = (xs - cx) * d / f
+        y_cam = -(ys - cy) * d / f
+        z_cam = -d
+        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
+        points_world = cam_pos + points_cam @ cam_rot.T
+        return float(points_world[:, 2].mean())
 
     def _apply_action(self, action: np.ndarray) -> None:
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
@@ -195,29 +251,13 @@ class RLPixelPickController:
         return ((left + right) * 0.5).copy()
 
     def _finger_contact(self) -> tuple[bool, bool]:
-        left_geoms = {
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, g)
-            for g in ("left_finger_collision", "left_fingertip_collision")
-            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, g) >= 0
-        }
-        right_geoms = {
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, g)
-            for g in ("right_finger_collision", "right_fingertip_collision")
-            if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, g) >= 0
-        }
-        obj_geoms = set()
-        obj_body = self.object_body_id
-        for gid in range(self.model.ngeom):
-            if self.model.geom_bodyid[gid] == obj_body:
-                obj_geoms.add(gid)
-
         left_touch = right_touch = False
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             g1, g2 = int(c.geom1), int(c.geom2)
             pair = {g1, g2}
-            if pair & left_geoms and pair & obj_geoms:
+            if pair & self._left_finger_geoms and pair & self._object_geoms:
                 left_touch = True
-            if pair & right_geoms and pair & obj_geoms:
+            if pair & self._right_finger_geoms and pair & self._object_geoms:
                 right_touch = True
         return left_touch, right_touch

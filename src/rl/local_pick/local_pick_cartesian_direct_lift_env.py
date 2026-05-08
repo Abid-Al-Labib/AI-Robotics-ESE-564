@@ -33,6 +33,7 @@ class LocalPickCartesianDirectLiftEnv(LocalPickCartesianEnv):
         self._best_score = 0.0
         self._reached_box = False
         self._success_hold_count = 0
+        self._prev_object_lift = 0.0
         return obs, info
 
     def _compute_reward(self, cart_action: np.ndarray, gripper_cmd: float) -> tuple[float, dict]:
@@ -44,6 +45,7 @@ class LocalPickCartesianDirectLiftEnv(LocalPickCartesianEnv):
         table_penalty = self._table_collision_penalty()
 
         left_touch, right_touch = self._finger_object_contact()
+        both_touch = left_touch and right_touch
         # EE must be at grasp height before contact counts toward grasping.
         ee_at_grasp_height = ee_pos[2] <= self.initial_object_z + 0.06
         gripper_grasping = (gripper_cmd > 0) and (left_touch or right_touch) and ee_at_grasp_height
@@ -72,8 +74,20 @@ class LocalPickCartesianDirectLiftEnv(LocalPickCartesianEnv):
         if gripper_cmd > 0 and not self._reached_box and gt_distance > self.config.premature_close_threshold:
             premature_close_penalty = 0.5
 
+        # Both-finger bonus: reward centered grasp.
+        both_finger_bonus = self.config.both_finger_bonus if both_touch and ee_at_grasp_height else 0.0
+
+        # Drop penalty: penalise releasing the object after a meaningful lift.
+        drop_penalty = 0.0
+        if (self._prev_object_lift >= self.config.hold_lift_threshold
+                and object_lift < self._prev_object_lift * 0.5):
+            drop_penalty = self.config.drop_penalty
+        self._prev_object_lift = object_lift
+
         reward = (
             progress_reward
+            + both_finger_bonus
+            - drop_penalty
             - premature_close_penalty
             - 0.01 * action_penalty
             - 1.0 * table_penalty
@@ -93,6 +107,8 @@ class LocalPickCartesianDirectLiftEnv(LocalPickCartesianEnv):
             "reached_box": float(self._reached_box),
             "gripper_grasping": float(gripper_grasping),
             "premature_close_penalty": premature_close_penalty,
+            "both_finger_bonus": both_finger_bonus,
+            "drop_penalty": drop_penalty,
             "success_hold_count": float(self._success_hold_count),
             # Stub keys so evaluate_cartesian.py prints cleanly.
             "align_close_bonus": 0.0,
@@ -107,8 +123,12 @@ class LocalPickCartesianDirectLiftEnv(LocalPickCartesianEnv):
     def _is_success(self) -> bool:
         object_lift = float(max(0.0, self.data.xpos[self.object_body_id][2] - self.initial_object_z))
         left_touch, right_touch = self._finger_object_contact()
-        if object_lift >= self.config.min_lift_for_success and (left_touch or right_touch):
+        if self.config.require_both_fingers:
+            contact_ok = left_touch and right_touch
+        else:
+            contact_ok = left_touch or right_touch
+        if object_lift >= self.config.min_lift_for_success and contact_ok:
             self._success_hold_count += 1
         else:
             self._success_hold_count = 0
-        return self._success_hold_count >= 3
+        return self._success_hold_count >= self.config.success_hold_steps

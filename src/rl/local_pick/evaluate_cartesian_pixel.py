@@ -22,6 +22,9 @@ def parse_args():
     parser.add_argument("--n-stack", type=int, default=3)
     parser.add_argument("--object-noise", type=float, default=0.0)
     parser.add_argument("--approach-noise", type=float, default=0.0)
+    parser.add_argument("--approach-z-noise", type=float, default=0.0)
+    parser.add_argument("--random-j7", action="store_true")
+    parser.add_argument("--full-table-random", action="store_true")
     parser.add_argument("--no-render", action="store_true")
     return parser.parse_args()
 
@@ -36,9 +39,11 @@ def main():
     args = parse_args()
     config = LocalPickConfig(
         seed=args.seed,
-        fixed_object_position=(0.5, -0.15, 0.125),
+        fixed_object_position=None if args.full_table_random else (0.5, -0.15, 0.125),
         object_xy_noise=args.object_noise,
         approach_xy_noise=args.approach_noise,
+        approach_z_noise=args.approach_z_noise,
+        random_j7=args.random_j7,
     )
 
     # Always run headless — render_mode="human" conflicts with the pixel renderer.
@@ -67,7 +72,10 @@ def main():
         try:
             import mujoco
             import mujoco.viewer as mj_viewer
-            raw_env = env.envs[0].env  # unwrap Monitor
+            inner = env
+            while hasattr(inner, 'venv'):
+                inner = inner.venv
+            raw_env = inner.envs[0]
             viewer = mj_viewer.launch_passive(raw_env.model, raw_env.data)
             print("Viewer launched. Watch the simulation window.")
         except Exception as e:

@@ -29,6 +29,20 @@ def parse_args():
     parser.add_argument("--full-table-random", action="store_true")
     parser.add_argument("--random-j7", action="store_true",
                         help="Randomise wrist joint (j7) at episode start so policy handles any pipeline approach.")
+    parser.add_argument("--min-lift", type=float, default=0.02,
+                        help="Minimum lift height (m) required for success.")
+    parser.add_argument("--hold-steps", type=int, default=3,
+                        help="Consecutive steps meeting lift+contact criteria to count as success.")
+    parser.add_argument("--require-both-fingers", action="store_true",
+                        help="Require both fingers contacting object for success (forces centered grasp).")
+    parser.add_argument("--both-finger-bonus", type=float, default=3.0,
+                        help="Reward for both fingers contacting object simultaneously.")
+    parser.add_argument("--drop-penalty", type=float, default=2.0,
+                        help="Penalty for dropping object after lifting it.")
+    parser.add_argument("--hold-lift-threshold", type=float, default=0.04,
+                        help="Min lift (m) before hold reward and drop penalty activate.")
+    parser.add_argument("--load-from", type=Path, default=None,
+                        help="Path to existing model zip to fine-tune from instead of training from scratch.")
     parser.add_argument("--dummy-vec", action="store_true")
     return parser.parse_args()
 
@@ -60,6 +74,12 @@ def main():
         approach_z_noise=args.approach_z_noise,
         joint_noise=args.joint_noise,
         random_j7=args.random_j7,
+        min_lift_for_success=args.min_lift,
+        success_hold_steps=args.hold_steps,
+        require_both_fingers=args.require_both_fingers,
+        both_finger_bonus=args.both_finger_bonus,
+        drop_penalty=args.drop_penalty,
+        hold_lift_threshold=args.hold_lift_threshold,
     )
 
     env_fns = [partial(_make_env, config, args.aug_pad) for _ in range(args.n_envs)]
@@ -87,22 +107,26 @@ def main():
     aug_label = f"random-shift pad={args.aug_pad}px" if args.aug_pad > 0 else "none"
     print(f"Device: {device}  |  Augmentation: {aug_label}  |  Buffer: {args.buffer_size:,}")
 
-    model = SAC(
-        "CnnPolicy",
-        env,
-        verbose=1,
-        seed=args.seed,
-        device=device,
-        learning_rate=1e-4,
-        buffer_size=args.buffer_size,
-        batch_size=256,
-        gamma=0.99,
-        tau=0.005,
-        train_freq=1,
-        gradient_steps=1,
-        learning_starts=1_000,
-        use_sde=False,
-    )
+    if args.load_from is not None:
+        model = SAC.load(args.load_from, env=env, device=device, verbose=1)
+        print(f"Fine-tuning from {args.load_from}")
+    else:
+        model = SAC(
+            "CnnPolicy",
+            env,
+            verbose=1,
+            seed=args.seed,
+            device=device,
+            learning_rate=1e-4,
+            buffer_size=args.buffer_size,
+            batch_size=256,
+            gamma=0.99,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            learning_starts=1_000,
+            use_sde=False,
+        )
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_cb = CheckpointCallback(

@@ -31,6 +31,11 @@ class LocalPickConfig:
     side_grasp_height: float = 0.03
     lift_success_z: float = 0.145   # kept for reference / pipeline clearance logic
     min_lift_for_success: float = 0.02  # must rise this many metres above initial camera estimate
+    success_hold_steps: int = 3        # consecutive steps meeting lift+contact criteria to count as success
+    require_both_fingers: bool = False  # require both fingers contacting for success (forces centered grasp)
+    both_finger_bonus: float = 3.0     # reward for both fingers contacting object simultaneously
+    drop_penalty: float = 2.0          # penalty for dropping object after having lifted it
+    hold_lift_threshold: float = 0.04  # min lift (m) before hold reward and drop penalty activate
 
     # Control.
     max_episode_steps: int = 75
@@ -52,7 +57,6 @@ class LocalPickConfig:
     premature_close_threshold: float = 0.10
     contact_reward: float = 1.0
     hold_reward: float = 5.0
-    hold_lift_threshold: float = 0.01
 
     @property
     def xml_path(self) -> Path:
