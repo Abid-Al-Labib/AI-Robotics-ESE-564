@@ -1,0 +1,560 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{array}
+
+\title{Hybrid Camera-Guided Planning and Local Reinforcement Learning\\for MuJoCo Bottle Pick-and-Place}
+
+\author{
+  Abid Al Labib \and
+  Cody Bandrowski \and
+  Hanshal Patel
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This project implements an end-to-end robot manipulation system for a randomized bottle pick-and-place task in MuJoCo using a Franka Panda arm. The final pipeline is hybrid. A camera-based perception module estimates world-frame object and goal positions from RGB-D observations. IKFast and RRT then generate collision-aware approach and transfer motions, and a trained soft actor-critic (SAC) policy handles the short local contact-rich pick phase. After a successful lift, the object is transported across a center divider obstacle and released over a randomized goal platform. The manipulated object is a multi-geom bottle rather than a single primitive, and both the bottle and goal positions vary across trials. The main strengths of the system are modularity, a clear separation between structured global planning and local learned control, and a complete physics-based pipeline. The main limitation is that the shipped local pick policy is still privileged: during the RL phase it observes simulator state rather than camera-derived local features, so the final system is camera-guided globally but not fully perception-driven at every stage. The repository includes the simulator scene, planner, controllers, training scripts, and the trained checkpoint used by the final runtime.
+\end{abstract}
+
+\section{Introduction}
+
+Robot manipulation is difficult because success depends on several subsystems working together at the same time. A robot must perceive the scene, convert perception into a task-relevant state estimate, plan safe motions in a constrained workspace, and execute contact-rich interactions without dropping the object. A system that appears to work in one fixed pose often fails once the object or goal is moved even slightly. The goal of this project was therefore to build a manipulation pipeline that solves a family of tabletop tasks rather than one hand-scripted demonstration.
+
+Our task is a bottle pick-and-place problem in MuJoCo. A Franka Panda arm must pick up a bottle-like object from one side of a table and move it across a divider obstacle onto a goal platform on the far side. The bottle start position and goal position are randomized at every trial, so the robot cannot simply replay a memorized joint-space trajectory.
+
+The final design is intentionally hybrid. We use camera-based perception and geometric planning for the large-scale, structured parts of the task and reinforcement learning only for the short local pick maneuver where contact dynamics matter most. This decomposition keeps the learning problem small and lets the model-based components handle the parts of the task that are already well-structured. At the same time, it yields a complete pipeline that integrates RGB-D perception, coordinate transforms, inverse kinematics, RRT planning, low-level motor control, gripper control, and RL.
+
+\section{Related Work and Background}
+
+The project combines ideas from physics-based simulation, sampling-based motion planning, classical robot kinematics, and modern deep reinforcement learning.
+
+MuJoCo provides the underlying physics engine and scene execution environment. It is well suited to this project because it supports accurate rigid-body contact simulation, articulated robot models, and camera rendering from the same simulator state used for control. The Franka Panda arm is a common manipulation platform, and the repository builds on Panda XML assets already structured for MuJoCo.
+
+For global motion planning, we use a single-query sampling-based planner in the RRT family. This is appropriate because the robot needs collision-free motions through a constrained workspace with a fixed divider obstacle, while the task only requires a small number of goal-directed plans per episode. RRT is especially useful here because the planner can operate directly in the robot's 7D joint space while using MuJoCo collision checks on interpolated configurations.
+
+For local grasping, we use soft actor-critic instead of a fully model-based grasp routine. This choice reflects the fact that the hardest part of the task is not moving through free space but making and maintaining stable contact with a bottle lying on its side. RL is therefore used only where contact, friction, and small pose differences are most important.
+
+The project also reflects an engineering lesson from coursework: reusing reliable modules is valuable when integrating a large system. The repository reuses an IKFast-based Panda kinematics module and a custom RRT implementation, which allowed the team to spend effort on integration, perception, and local grasp behavior rather than rebuilding every component from scratch.
+
+\section{Environment and Task Setup}
+
+\subsection{Simulator and robot platform}
+
+The scene is defined in \texttt{assets/mujoco/scene.xml} and executed by the wrapper in \texttt{src/environment/mujoco\_env.py}. The simulator is MuJoCo, and the robot is a 7-DOF Franka Panda arm with a two-finger parallel gripper.
+
+\begin{itemize}[leftmargin=*]
+    \item Simulator: MuJoCo.
+    \item Robot: Franka Panda arm with parallel-jaw gripper.
+    \item Arm control interface: the pipeline sets target values for seven joint actuators and steps physics until the arm settles near the requested configuration.
+    \item Gripper control interface: a single actuator command, with \texttt{255.0} used for open and \texttt{0.0} used for close.
+    \item Simulation timestep: \(0.002\) s.
+    \item Camera: one RGB-D camera named \texttt{perception\_cam} at position \((0.5, -0.7, 0.7)\) with \(60^\circ\) vertical field of view.
+\end{itemize}
+
+Each trial resets the robot to the same home joint configuration:
+\[
+q_{\text{home}} =
+[0,\ 0,\ 0,\ -1.57079,\ 0,\ 1.57079,\ -0.7853].
+\]
+The gripper is reset open with both finger joints at \(0.04\) m. This fixed reset state makes the global planning problem reproducible across trials.
+
+\subsection{Object, goal, and obstacle geometry}
+
+The manipulated object is a bottle-like rigid body named \texttt{pick\_object}. It is not a single primitive. Instead, it is composed of three geoms:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{bottle\_base}: box of size \((0.025,\ 0.025,\ 0.05)\) m and mass \(0.03\) kg,
+    \item \texttt{bottle\_shoulder}: sphere of radius \(0.014\) m and mass \(0.01\) kg,
+    \item \texttt{bottle\_cap}: cylinder of radius \(0.01\) m and half-length \(0.008\) m with mass \(0.005\) kg.
+\end{itemize}
+
+This satisfies the course requirement that at least one manipulated object is more complex than a single geom. The bottle is initialized lying on its side with quaternion
+\[
+[0.7071,\ 0.7071,\ 0,\ 0].
+\]
+
+The workspace includes a low table whose top surface is at \(z = 0.10\) m, a fixed center divider obstacle, and a free-moving green goal platform with short boundary walls. The obstacle is a box of size \((0.28,\ 0.012,\ 0.04)\) m centered at \((0.5,\ 0,\ 0.14)\), so its top is at \(z = 0.18\) m. This divider forces the robot to transport the object over an obstacle rather than along one trivial straight path.
+
+The goal platform is a square base of size \((0.10,\ 0.10,\ 0.002)\) m with four short side walls. It is modeled as a free body so its position can be randomized across episodes.
+
+\subsection{Scenario variability}
+
+The main environment randomizes the bottle and goal positions inside bounded tabletop regions using \texttt{MujocoEnv.generate\_random\_configs}. The bottle always starts on the camera side of the divider, while the goal is always placed on the far side.
+
+\begin{table}[H]
+  \caption{Scene randomization ranges used by the full pipeline}
+  \label{tab:randomization}
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    Variable & Range & Purpose \\
+    \midrule
+    Bottle \(x\) & \(0.43\) to \(0.57\) m & vary grasp location \\
+    Bottle \(y\) & \(-0.20\) to \(-0.10\) m & keep object on pick side \\
+    Goal \(x\) & \(0.43\) to \(0.57\) m & vary transfer target \\
+    Goal \(y\) & \(0.10\) to \(0.24\) m & keep goal on far side \\
+    Minimum object-goal distance & \(0.10\) m & avoid trivial placements \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Two negative results are also important because they clarify what the current system does \emph{not} randomize. The bottle orientation is fixed in the current repository, and the divider obstacle is fixed rather than randomized. The system therefore generalizes over position changes but not over arbitrary object orientations or obstacle layouts.
+
+\subsection{Success and failure definitions}
+
+The repository contains two related success notions: local RL success and full-pipeline success.
+
+For the local RL environment in \texttt{src/rl/local\_pick/local\_pick\_env.py}, success is explicitly defined as lifting the bottle above
+\[
+z_{\text{success}} = 0.145 \text{ m}.
+\]
+Because the object nominally starts at \(z = 0.125\) m, this corresponds to a lift of approximately \(2\) cm.
+
+For the full pipeline in \texttt{src/main.py}, there is no single benchmark script that writes an end-to-end success flag per trial. Operationally, a full trial is successful when:
+\begin{itemize}[leftmargin=*]
+    \item the perception module finds both the bottle and goal platform,
+    \item inverse kinematics and RRT find valid approach and transfer motions,
+    \item the local pick policy lifts the object above the RL success threshold,
+    \item the robot reaches a placement approach over the goal,
+    \item and the released object lands on the goal platform rather than being dropped early.
+\end{itemize}
+
+Failures therefore come from perception misses, unreachable or colliding IK targets, planner failure, unstable grasping, or slip during transfer and release.
+
+\section{Method}
+
+\subsection{System overview}
+
+The final runtime in \texttt{src/main.py} follows the sequence below:
+\begin{enumerate}[leftmargin=*]
+    \item sample randomized bottle and goal positions;
+    \item reset the MuJoCo scene to that configuration;
+    \item render RGB and depth from the perception camera;
+    \item estimate world-frame bottle and goal positions from the image;
+    \item compute an IK goal for a pick-approach pose above the bottle;
+    \item use RRT in 7D joint space to plan a collision-free path to that approach;
+    \item execute the planned arm trajectory with motor targets;
+    \item run a trained SAC policy for the local pick and lift phase;
+    \item if the lift succeeds, move to a vertical clearance pose;
+    \item plan with RRT to a place-approach pose above the goal;
+    \item open the gripper and release the object.
+\end{enumerate}
+
+This is a hybrid architecture in two different senses. First, it combines model-based planning with learning-based local manipulation. Second, it combines perception-derived global state with privileged local state. The camera is used to localize the object and goal for global planning, but the local RL controller still receives simulator-state observations during the contact phase.
+
+\subsection{Perception module}
+
+The perception code is implemented in \texttt{src/pipeline/perception/perception.py}. It renders both RGB and depth images from the MuJoCo camera \texttt{perception\_cam}. Object detection is intentionally simple: the code color-thresholds the RGB image to identify pixels close to the bottle color and goal color and then returns the center of the image-space bounding box of each region.
+
+\begin{itemize}[leftmargin=*]
+    \item Input: RGB image and aligned depth image.
+    \item Output: world-frame 3D position of the bottle and goal platform.
+    \item Image size: \(640 \times 480\).
+    \item Detection rule: Euclidean RGB distance threshold around \([230, 38, 38]\) for the bottle and \([26, 217, 26]\) for the goal.
+    \item Threshold: \(50\) in RGB value space.
+\end{itemize}
+
+Given a detected pixel \((u,v)\) and depth \(Z\), the code reconstructs a camera-frame point using the camera field of view:
+\[
+f = \frac{0.5H}{\tan(\text{fovy}/2)},
+\]
+\[
+X_c = \frac{(u-c_x)Z}{f}, \quad
+Y_c = -\frac{(v-c_y)Z}{f}, \quad
+Z_c = -Z.
+\]
+Here \(H\) is image height, \((c_x,c_y)\) is the image center, and the sign convention matches the MuJoCo camera coordinates used by the renderer.
+
+The resulting camera-frame point is converted into world coordinates using the camera pose already stored by MuJoCo:
+\[
+p_w = p_{\text{cam}} + R_{wc} p_c,
+\]
+where \(p_{\text{cam}}\) is the world-frame camera position and \(R_{wc}\) is the camera rotation matrix obtained from \texttt{data.cam\_xmat}.
+
+This perception module is enough for the project because the bottle orientation is fixed and the global planner only needs position estimates. The main limitation is that no filtering, confidence estimation, or learned segmentation is used. The detection is therefore fast and deterministic but not robust to visually complex scenes.
+
+\subsection{Waypoint generation}
+
+The runtime does not construct a large symbolic manipulation graph. Instead, it generates a small set of task-level target poses directly from the perceived object and goal locations.
+
+\begin{table}[H]
+  \caption{Task-level waypoints used by the final runtime}
+  \label{tab:waypoints}
+  \centering
+  \begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth} >{\raggedright\arraybackslash}p{0.34\linewidth} >{\raggedright\arraybackslash}p{0.36\linewidth}}
+    \toprule
+    Waypoint & Description & Computation in code \\
+    \midrule
+    Pick approach & safe pose above bottle before local grasp & \(p_{\text{pick}} + [0, 0, 0.15]\) \\
+    RL local pick region & short contact-rich descent, close, and lift phase & current state after pick approach \\
+    Clearance lift & raise the grasped bottle above divider before transfer & same \(x,y\) as pick, \(z = 0.38\) \\
+    Place approach & high pose above goal platform & \(p_{\text{goal}} + [0, 0, 0.25]\) \\
+    Release & open gripper over the goal region & same pose as place approach \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The most important simplification is at placement time. There is no separate low placement pose or learned placement controller in the current code. After the object is transported above the goal, the robot simply opens the gripper. This is enough to demonstrate end-to-end manipulation but makes placement more sensitive to drop dynamics.
+
+\subsection{Motion planning}
+
+Global arm motion is handled by \texttt{src/pipeline/planner/rrt\_planner.py}. The planner operates in the Panda's 7D joint space. For each target pose, inverse kinematics first produces one or more goal joint configurations. RRT then plans from the current arm state to one goal configuration while checking collisions in the full MuJoCo scene.
+
+\begin{itemize}[leftmargin=*]
+    \item State space: 7D arm joint space.
+    \item Start state: current arm joint vector from MuJoCo.
+    \item Goal state: IK solution for the target end-effector pose.
+    \item Goal bias: with probability \(0.1\), sample the goal directly.
+    \item Extension step size: \(0.1\) rad.
+    \item Maximum iterations: \(20{,}000\).
+    \item Goal connection rule: connect directly when the newest node is within one step of the goal and the edge is collision free.
+    \item Path smoothing: up to \(1000\) shortcut smoothing iterations.
+\end{itemize}
+
+Collision checking interpolates between two joint configurations and calls MuJoCo collision detection on each interpolation point. The planner ignores a small set of always-overlapping adjacent robot-body pairs to prevent false positives. After a successful grasp, it can also ignore contacts between the gripper and the held object so that transfer planning does not reject the grasp itself as a collision.
+
+This planner is especially useful during transport because the center divider blocks trivial straight-line motion between the pick side and the goal side. The explicit vertical clearance lift to \(z=0.38\) m also makes the subsequent transport plan easier.
+
+\subsection{Inverse kinematics and low-level control}
+
+Inverse kinematics is implemented by the IKFast wrapper in \texttt{src/pipeline/controller/kinematics.py}. Given a desired end-effector position and rotation matrix, the solver samples \(100\) values for the free joint over \([-2.8,\ 2.8]\) and aggregates all IK solutions returned by the generated Panda solver.
+
+For top-down approach, the runtime fixes the end-effector orientation to
+\[
+R_{\text{pick}} =
+\begin{bmatrix}
+1 & 0 & 0 \\
+0 & -1 & 0 \\
+0 & 0 & -1
+\end{bmatrix}.
+\]
+The pipeline then filters candidate IK solutions by collision validity and selects the valid solution closest to the current arm configuration.
+
+Once a joint target \(q^\ast\) is chosen, the arm controller in \texttt{src/pipeline/controller/arm\_controller.py} executes it through actuator target interpolation. Large joint motions are divided into small segments, with default maximum per-joint increment \(0.04\) rad. Each intermediate target is held until both joint position error and joint velocity norm are small. If the final waypoint error is still large, \texttt{src/main.py} retries the move with smaller target increments and tighter tolerances.
+
+The gripper controller in \texttt{src/pipeline/controller/gripper\_controls.py} is simpler. It holds the arm at its current joint configuration, commands the gripper open or closed, and steps physics until the finger motion settles. The object is therefore grasped through contact forces in the simulator rather than by manually overwriting object state.
+
+\subsection{Learning-based local pick component}
+
+The local learned policy is loaded by \texttt{src/pipeline/localPick/rl\_local\_pick.py}. It is a \textbf{soft actor-critic (SAC)} policy, not PPO. The training environment is \texttt{src/rl/local\_pick/local\_pick\_env.py}, which starts each episode with the robot already near a pick-approach pose. This isolates the contact-rich part of the task and keeps RL from wasting samples on long collision-free travel motions that planning already handles well.
+
+\paragraph{Observation space.}
+The local pick policy uses a 20-dimensional privileged state vector:
+\begin{itemize}[leftmargin=*]
+    \item 7 arm joint positions,
+    \item 7 arm joint velocities,
+    \item 3 values for end-effector position minus bottle position,
+    \item 1 scalar bottle lift term \(z_{\text{object}} - z_{\text{initial}}\),
+    \item 1 gripper opening value,
+    \item 1 phase flag indicating whether the gripper is open or closed.
+\end{itemize}
+
+\paragraph{Action space.}
+The policy outputs an 8-dimensional action:
+\begin{itemize}[leftmargin=*]
+    \item 7 joint-space delta commands scaled by \(0.02\) rad,
+    \item 1 gripper command, where positive means close and non-positive means open.
+\end{itemize}
+
+\paragraph{Reward.}
+The reward combines reaching, lift, contact quality, and penalties:
+\[
+R =
+- w_r \|p_{ee}-p_{obj}\|
++ w_l \Delta z
++ R_{\text{align-close}}
++ R_{\text{contact}}
++ R_{\text{hold}}
+- R_{\text{premature-close}}
+- w_a \|a\|^2
+- R_{\text{table}}.
+\]
+If the bottle reaches the lift-success threshold, a success bonus is added.
+
+The concrete reward parameters in \texttt{LocalPickConfig} are:
+\begin{itemize}[leftmargin=*]
+    \item reach weight \(= 1.0\),
+    \item lift weight \(= 20.0\),
+    \item success bonus \(= 200.0\),
+    \item action penalty weight \(= 0.01\),
+    \item table collision penalty \(= 2.0\),
+    \item align-close bonus \(= 2.0\),
+    \item align-close threshold \(= 0.015\) m,
+    \item premature close penalty \(= 5.0\),
+    \item premature close threshold \(= 0.06\) m,
+    \item contact bonus \(= 2.0\),
+    \item hold reward \(= 5.0\),
+    \item hold-lift threshold \(= 0.01\) m.
+\end{itemize}
+
+\paragraph{Episodes and training.}
+Episodes last at most \(75\) decision steps, each followed by \(20\) MuJoCo simulation steps. The current checked-in training script in \texttt{src/rl/local\_pick/train.py} constructs vectorized Gymnasium environments and trains SAC with an MLP policy. Its default hyperparameters are learning rate \(3 \times 10^{-4}\), replay buffer size \(1{,}000{,}000\), batch size \(512\), discount factor \(0.99\), \(\tau = 0.005\), and state-dependent exploration.
+
+The shipped model checkpoint used by the runtime is \texttt{models/privileged\_model\_v1.zip}. Its accompanying note \texttt{models/PRIVILEGED\_MODEL\_V1.md} records \(8/10\) successful end-to-end trials and documents a somewhat different training configuration, including buffer size \(200{,}000\), batch size \(256\), and \texttt{gradient\_steps = 2}. This discrepancy suggests the checkpoint was trained with an earlier version of the training script. That fact matters for reproducibility and is discussed again later.
+
+\subsection{Integration details}
+
+The implementation is intentionally modular:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{src/main.py}: top-level runtime loop over randomized trials.
+    \item \texttt{src/environment/mujoco\_env.py}: scene reset, random trial generation, and home configuration logic.
+    \item \texttt{src/pipeline/perception/perception.py}: RGB-D rendering and 3D localization.
+    \item \texttt{src/pipeline/controller/kinematics.py}: IKFast wrapper.
+    \item \texttt{src/pipeline/planner/rrt\_planner.py}: joint-space RRT planning with collision checking.
+    \item \texttt{src/pipeline/controller/arm\_controller.py}: smooth actuator-target execution.
+    \item \texttt{src/pipeline/controller/gripper\_controls.py}: open and close commands.
+    \item \texttt{src/pipeline/localPick/rl\_local\_pick.py}: runtime wrapper for the SAC local pick policy.
+    \item \texttt{src/rl/local\_pick/*}: isolated RL training and evaluation code.
+\end{itemize}
+
+The data flow is camera image \(\rightarrow\) estimated 3D positions \(\rightarrow\) target end-effector poses \(\rightarrow\) IK joint goals \(\rightarrow\) RRT trajectories \(\rightarrow\) actuator-level execution, with the SAC module inserted only for the local pick phase after the approach motion.
+
+\section{Experimental Setup}
+
+\subsection{Evaluation protocol}
+
+The full runtime in \texttt{src/main.py} generates \(10\) randomized object-goal pairs and runs one pick-and-place attempt for each pair. The evaluation therefore covers multiple scenarios, but it is not yet a full benchmark harness with automatic CSV logging, saved seeds, or recovery behaviors.
+
+\begin{itemize}[leftmargin=*]
+    \item Number of full-pipeline trials per run: \(10\).
+    \item Randomized factors: bottle position and goal position.
+    \item Fixed factors: bottle orientation, divider location, camera pose, and top-down grasp orientation.
+    \item Local RL evaluation utility: \texttt{src/rl/local\_pick/evaluate.py}.
+\end{itemize}
+
+The runtime is largely open-loop within a trial. Perception is performed before the main pick and place stages, and there is no repeated perception-and-replan loop after every small motion. That design keeps the system manageable but means there is no correction if the grasp starts to drift.
+
+The local RL environment is evaluated separately from the full pipeline. It resets the arm directly near a pick-approach pose and measures whether the policy can reach, close, and lift the bottle above the success threshold. This gives a more isolated measure of local grasp quality.
+
+\subsection{Metrics}
+
+The repository naturally supports three classes of metrics:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Local pick success}: whether the bottle exceeds the lift threshold \(z \geq 0.145\) m.
+    \item \textbf{Planner and IK success}: whether a collision-free approach or transfer motion is found.
+    \item \textbf{End-to-end task success}: whether the bottle is ultimately released onto the goal platform.
+\end{itemize}
+
+For reporting, the relevant formulas are:
+\[
+\text{Success Rate} =
+\frac{\text{Number of Successful Trials}}{\text{Total Number of Trials}},
+\]
+\[
+\text{Planning Success Rate} =
+\frac{\text{Trials with Valid Motion Plans}}{\text{Total Number of Trials}}.
+\]
+
+The current code prints detailed diagnostics but does not yet aggregate all metrics into a single experiment file. As a result, the strongest end-to-end number stored directly in the repository is the \(8/10\) success result documented with the shipped checkpoint.
+
+\subsection{Software stack and reproducibility}
+
+The repository provides dependency lists in \texttt{requirements.txt} and \texttt{src/requirements.txt}. The checked-in requirements target Python 3.11 with MuJoCo, Gymnasium, Stable-Baselines3, and PyTorch. The environment used to inspect the repository during report writing has Python \(3.11.8\) and MuJoCo \(3.2.3\) installed, while the repository requirements pin MuJoCo \(3.6.0\).
+
+The codebase does \emph{not} record the original training machine's exact CPU, GPU, RAM, or operating system. Those hardware details are therefore omitted from any quantitative claim in this report rather than being guessed.
+
+The most important reproducibility caveat is that the shipped model note and the current training defaults are not identical. The final checkpoint note records one set of hyperparameters, while the current training script exposes slightly different defaults. The report therefore treats the model note as the source of truth for the quantitative result attached to the shipped checkpoint and treats the current code as the latest available training implementation.
+
+\section{Results}
+
+\subsection{Overall task performance}
+
+The clearest end-to-end result available in the repository is the number recorded in \texttt{models/PRIVILEGED\_MODEL\_V1.md}: with the included local pick checkpoint, the system completed \(8\) successful bottle pick-and-place trials out of \(10\). This result is tied directly to the artifact checked into the repository rather than reconstructed from memory.
+
+\begin{table}[H]
+  \caption{Reported end-to-end performance of the shipped final checkpoint}
+  \label{tab:overall-results}
+  \centering
+  \begin{tabular}{ll}
+    \toprule
+    Metric & Value \\
+    \midrule
+    Full-pipeline trials & 10 \\
+    Successful trials & 8 \\
+    Success rate & 80\% \\
+    Randomized variables & bottle position, goal position \\
+    Fixed object orientation & side-lying bottle pose \\
+    Fixed obstacle & center divider present in all trials \\
+    Runtime local policy & \texttt{models/privileged\_model\_v1.zip} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+An \(80\%\) success rate is strong enough to show that the pipeline generalizes beyond one fixed scene configuration. At the same time, it is not high enough to hide the remaining weaknesses. The system is reliable enough to demonstrate the core idea, but local grasp robustness and release accuracy still limit end-to-end consistency.
+
+\subsection{Why the pipeline works when it works}
+
+The structure of the task explains much of the success. Once the bottle and goal are localized, the large-scale motion problem is relatively well-behaved: the robot starts from a known home pose, the obstacle layout is fixed, the workspace bounds are narrow, and the RRT planner only needs to solve two goal-directed arm motions per trial. The planning and transport stages are therefore easier than the local contact phase.
+
+The hybrid decomposition also helps. RRT and IK handle the long-range motion problem efficiently, while the SAC policy only has to solve a short local maneuver. This is a much more practical use of learning than attempting to train one monolithic policy from reset to final placement.
+
+\subsection{Module-level behavior}
+
+Even without a full benchmark harness, the code and stored notes make the behavior of each module fairly clear.
+
+\begin{table}[H]
+  \caption{Module-level observations from the implementation and stored model note}
+  \label{tab:module-results}
+  \centering
+  \begin{tabular}{>{\raggedright\arraybackslash}p{0.23\linewidth} >{\raggedright\arraybackslash}p{0.25\linewidth} >{\raggedright\arraybackslash}p{0.42\linewidth}}
+    \toprule
+    Module & Role & Observed behavior \\
+    \midrule
+    Perception & bottle and goal localization & simple and fast; adequate in the color-coded scene but sensitive to thresholding assumptions \\
+    IK + RRT & approach and transfer planning & generally reliable once targets are reachable and collision free \\
+    Local SAC pick & contact-rich grasp and lift & dominant source of trial-to-trial variability \\
+    Place stage & release over goal platform & simple handoff, but no fine placement correction \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The dominant difficulty is local manipulation, not global planning. Once the object is securely grasped and lifted, transporting it above the divider is comparatively structured. The repository notes also indicate that some failures occur after fingers make contact, which reinforces the conclusion that the limiting factor is stable grasp execution rather than scene-level planning.
+
+\subsection{Failure analysis}
+
+The code and \texttt{REVIEW\_NOTES.md} point to three recurring failure sources.
+
+\paragraph{1. IK solution mismatch between training and runtime.}
+During RL environment reset, the local-pick training code chooses the IK solution closest to the home configuration. In the full runtime, the pick approach code instead chooses the valid IK solution closest to the \emph{current} arm configuration. This can rotate the wrist into a different orientation than the policy saw in training, which changes finger-object contact geometry and can lead to drops or weak grasps.
+
+\paragraph{2. Approach-height mismatch.}
+The RL environment uses an approach height of \(0.16\) m above the bottle, while the runtime pick approach adds \(0.15\) m to the \emph{perceived} bottle center. Because perception often estimates the bottle center near the top of the visible object rather than the nominal object origin, the runtime approach can start roughly \(1.6\) cm higher than the training distribution. For a local manipulation policy, that is a significant mismatch.
+
+\paragraph{3. Perception noise beyond the RL training distribution.}
+The local policy uses privileged state and is therefore not directly robust to image noise. When the global pipeline hands off from camera localization to the local pick phase, small perception errors shift the approach state seen by the policy. The repository review notes explicitly call out that the runtime camera error can be larger than the perturbations used during RL training.
+
+\paragraph{4. Limited placement strategy.}
+The current placement stage moves to a pose \(25\) cm above the goal and opens the gripper there. That is enough to demonstrate a complete pick-lift-transfer-release pipeline, but it does not provide careful low-level placement or closed-loop correction. This simplicity is likely responsible for some failures even after a successful grasp.
+
+\subsection{Qualitative behavior}
+
+Qualitatively, the system demonstrates the full manipulation stack targeted by the project. The robot perceives a randomized bottle-goal arrangement, plans to the bottle, performs a local learned grasp and lift, clears a divider obstacle, and releases over a randomized goal region. The course video submission is therefore an important qualitative complement to the limited numeric logging in the current repository.
+
+\section{Discussion}
+
+The most effective design choice in the project was decomposition. Using RRT and IK for long-range movement was sensible because the workspace geometry is known and the obstacle is fixed. Using RL only for the short local pick phase was sensible because grasping a side-lying bottle is the most contact-sensitive part of the task. This division made the problem manageable and kept the learned component focused on the hardest part.
+
+The main challenge was integration rather than any one isolated algorithm. The camera, coordinate transforms, IK, planner, controller, and RL policy all have to agree on pose conventions, reset states, and timing. Small mismatches are enough to break the full system, even when each subsystem appears individually reasonable. The review notes make this explicit: the largest failures come from small distribution shifts between what the local policy was trained on and what the rest of the runtime actually delivers.
+
+The final system is also a useful illustration of an engineering tradeoff. It is not a pure end-to-end vision policy, and it is not a fully classical controller either. Instead, it is a pragmatic hybrid system that works on a nontrivial randomized task and makes the remaining weak points visible in a way that can guide the next iteration.
+
+\section{Limitations and Future Work}
+
+\paragraph{Limitations.}
+\begin{itemize}[leftmargin=*]
+    \item The shipped local pick policy is privileged and observes simulator state rather than camera features.
+    \item Bottle orientation is fixed rather than randomized.
+    \item The obstacle layout is fixed, so obstacle generalization is limited.
+    \item Placement is open-loop and performed from a high release pose instead of a careful low placement pose.
+    \item The perception module uses simple color thresholding and would not transfer to visually complex scenes.
+    \item The repository does not yet include a dedicated benchmark script that automatically logs end-to-end success and timing statistics.
+\end{itemize}
+
+\paragraph{Future work.}
+\begin{itemize}[leftmargin=*]
+    \item Replace privileged local observations with camera-derived local state or learned visual features.
+    \item Align the runtime pick approach distribution with the local RL training distribution.
+    \item Add a separate local placement controller instead of releasing from the high approach pose.
+    \item Randomize bottle orientation and add more object categories.
+    \item Add closed-loop re-perception and replanning after the grasp.
+    \item Upgrade perception from fixed RGB thresholding to segmentation, keypoint detection, or learned pose estimation.
+    \item Add a dedicated evaluation script that records success, time, and failure mode for every trial.
+\end{itemize}
+
+\section{Reproducibility and Code Submission}
+
+The repository already contains the core material needed for a code submission: a README, requirements files, MuJoCo assets, runtime code, RL training and evaluation scripts, and the trained model artifact used by the final pipeline.
+
+\subsection{Repository structure}
+
+\begin{verbatim}
+AI-Robotics-ESE-564/
+  README.md
+  report.tex
+  requirements.txt
+  REVIEW_NOTES.md
+  models/
+    privileged_model_v1.zip
+    PRIVILEGED_MODEL_V1.md
+  assets/
+    mujoco/
+      scene.xml
+      panda.xml
+      panda_assets/
+  configs/
+    sim_config.yaml
+  src/
+    main.py
+    requirements.txt
+    environment/
+      mujoco_env.py
+    pipeline/
+      controller/
+      perception/
+      planner/
+      localPick/
+    rl/
+      local_pick/
+\end{verbatim}
+
+\subsection{How to run}
+
+From the repository root, the main runtime is:
+
+\begin{verbatim}
+pip install -r requirements.txt
+python src/main.py
+\end{verbatim}
+
+For isolated local-pick training and evaluation:
+
+\begin{verbatim}
+python src/rl/local_pick/train.py --timesteps 100000
+python src/rl/local_pick/evaluate.py --model-path models/local_pick_sac.zip
+\end{verbatim}
+
+The full runtime generates 10 randomized trials, opens a MuJoCo viewer, prints perceived positions, attempts the pick-and-place sequence for each trial, and reports local-pick success per trial in the console.
+
+\section*{References}
+
+\begin{enumerate}[leftmargin=*]
+    \item E. Todorov, T. Erez, and Y. Tassa. MuJoCo: A physics engine for model-based control. \emph{2012 IEEE/RSJ International Conference on Intelligent Robots and Systems}, 2012.
+    \item J. J. Kuffner and S. M. LaValle. RRT-Connect: An efficient approach to single-query path planning. \emph{Proceedings of the 2000 IEEE International Conference on Robotics and Automation}, 2000.
+    \item T. Haarnoja, A. Zhou, P. Abbeel, and S. Levine. Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor. \emph{Proceedings of the 35th International Conference on Machine Learning}, 2018.
+    \item Stable-Baselines3 documentation. \url{https://stable-baselines3.readthedocs.io/}
+    \item IKFast documentation in OpenRAVE. \url{http://openrave.org/docs/latest_stable/openravepy/ikfast/}
+    \item DeepMind MuJoCo Playground manipulation examples. \url{https://github.com/google-deepmind/mujoco_playground}
+    \item Pick-101 repository referenced during project exploration. \url{https://github.com/ggand0/pick-101}
+\end{enumerate}
+
+\appendix
+
+\section{Additional Implementation Details}
+
+\paragraph{Full-pipeline constants.}
+The main runtime uses 10 randomized trials, pick approach offset \(+0.15\) m in \(z\), clearance lift height \(z = 0.38\) m, and place approach offset \(+0.25\) m in \(z\). RRT uses step size \(0.1\), maximum \(20{,}000\) iterations, and shortcut smoothing up to \(1000\) iterations.
+
+\paragraph{RL task constants.}
+The local RL task uses action scale \(0.02\), frame skip \(20\), maximum episode length \(75\), success threshold \(z = 0.145\) m, open-gripper control \(255.0\), and close-gripper control \(0.0\).
+
+\paragraph{Known reproducibility caveat.}
+The final checkpoint note and current \texttt{train.py} defaults do not match exactly. The checkpoint note records a concrete final artifact result and should therefore be treated as the authoritative source for the reported \(8/10\) end-to-end outcome, while the training script documents the current form of the codebase.
+
+\end{document}
